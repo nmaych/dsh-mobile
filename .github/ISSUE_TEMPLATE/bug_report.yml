@@ -1,0 +1,78 @@
+name: 报告问题
+description: 应用崩溃、连不上、显示不对
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先确认：**设置页底部的版本号是最新的吗？** 旧版本的问题可能已经修好了。
+
+        安全问题请**不要**在这里提，用 [SECURITY.md](../blob/main/SECURITY.md) 里的私密渠道。
+
+  - type: input
+    id: version
+    attributes:
+      label: 应用版本
+      description: 设置页底部显示的版本号
+      placeholder: '例如 1.1.0'
+    validations:
+      required: true
+
+  - type: input
+    id: android
+    attributes:
+      label: 手机系统版本
+      placeholder: '例如 Android 14 / 小米 HyperOS 1.0'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行模式
+      options:
+        - 远程控制桌面端
+        - 独立 API 对话
+        - 两者都试过
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 你做了什么、期望什么、实际发生了什么
+      placeholder: |
+        1. 打开设置，点了「搜索电脑」
+        2. 列表里出现了电脑，点了它
+        3. 输入配对码后提示「连接不上」
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-text
+    attributes:
+      label: 界面上的错误提示原文
+      description: 应用会把服务端返回的具体原因显示出来，请**照抄**，不要概括
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: dsh-version
+    attributes:
+      label: 桌面端 DSH 版本
+      description: 远程控制模式下需要。在桌面端终端或设置里可以看到
+      placeholder: '例如 0.2.0-rc.2'
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我用的是最新 Release
+          required: true
+        - label: 我搜过已有的 issue
+          required: true

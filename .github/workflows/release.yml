@@ -1,0 +1,199 @@
+name: Release
+
+# Publishing is tag-driven: push `v1.1.0` and this builds, signs, verifies and
+# publishes.
+#
+# Why the tag is the single source of truth: the APK's versionCode, the APK
+# filename and update.json's versionCode all have to agree, or the in-app
+# updater either never offers the new build or offers the same one forever.
+# Deriving all three from one tag makes that impossible to get wrong.
+#
+# The arithmetic and changelog parsing live in tools/release-metadata.mjs, which
+# is unit-tested offline (test/release-logic.test.mjs). This workflow calls that
+# script rather than reimplementing the rules, so the two cannot drift.
+#
+# Publishes two release assets:
+#   dsh-mobile-<version>.apk   the signed APK
+#   update.json                the manifest the app polls
+#
+# The app reads the manifest from
+#   https://github.com/<owner>/<repo>/releases/latest/download/update.json
+# which GitHub serves from the newest non-prerelease release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, e.g. 1.1.0 (no leading v)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # ---------------------------------------------------------------------
+      # Resolve the version from the tag.
+      # ---------------------------------------------------------------------
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+            TAG="v${VERSION}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+          fi
+
+          # The script validates MAJOR.MINOR.PATCH and fails on anything else,
+          # so a malformed tag stops the release here rather than producing an
+          # APK whose version does not match its tag.
+          CODE="$(node tools/release-metadata.mjs version "$VERSION")"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE"       >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "Resolved $VERSION -> versionCode $CODE (tag $TAG)"
+
+      # Prove the release logic before trusting it with a published artifact.
+      - name: Test release logic
+        run: node test/release-logic.test.mjs
+
+      # ---------------------------------------------------------------------
+      # Materialise the keystore from secrets.
+      #
+      # DSH_KEYSTORE_BASE64 is the .jks base64-encoded, so it survives being
+      # pasted into a secret field. The file is written outside the checkout
+      # and removed by the runner when the job ends.
+      # ---------------------------------------------------------------------
+      - name: Decode keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.DSH_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ]; then
+            echo "::error::Secret DSH_KEYSTORE_BASE64 is not set. See docs/RELEASING.md."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "DSH_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+          echo "Keystore decoded ($(stat -c%s "$RUNNER_TEMP/release.jks") bytes)"
+
+      - name: Build signed release
+        working-directory: app-project
+        env:
+          DSH_VERSION_CODE: ${{ steps.version.outputs.code }}
+          DSH_VERSION_NAME: ${{ steps.version.outputs.version }}
+          DSH_KEYSTORE_PASSWORD: ${{ secrets.DSH_KEYSTORE_PASSWORD }}
+          DSH_KEY_ALIAS: ${{ secrets.DSH_KEY_ALIAS }}
+          DSH_KEY_PASSWORD: ${{ secrets.DSH_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ---------------------------------------------------------------------
+      # Verify before publishing.
+      #
+      # A mis-signed or version-mismatched APK is worse than no release: users
+      # install it and then cannot update again.
+      # ---------------------------------------------------------------------
+      - name: Verify APK
+        id: verify
+        working-directory: app-project
+        env:
+          EXPECTED_CODE: ${{ steps.version.outputs.code }}
+          EXPECTED_NAME: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/release/app-release.apk"
+          test -f "$APK" || { echo "::error::No release APK produced"; exit 1; }
+
+          AAPT2="$ANDROID_HOME/build-tools/34.0.0/aapt2"
+          BADGING="$("$AAPT2" dump badging "$APK")"
+          CODE="$(printf '%s' "$BADGING" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)"
+          NAME="$(printf '%s' "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+
+          echo "APK reports versionCode=$CODE versionName=$NAME"
+          [ "$CODE" = "$EXPECTED_CODE" ] || { echo "::error::versionCode $CODE != $EXPECTED_CODE"; exit 1; }
+          [ "$NAME" = "$EXPECTED_NAME" ] || { echo "::error::versionName $NAME != $EXPECTED_NAME"; exit 1; }
+
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose "$APK" \
+            || { echo "::error::APK signature did not verify"; exit 1; }
+
+          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -c -v 4 "$APK" >/dev/null \
+            || { echo "::error::APK is not zipaligned"; exit 1; }
+
+          OUT="dsh-mobile-${EXPECTED_NAME}.apk"
+          cp "$APK" "$OUT"
+          SHA="$(sha256sum "$OUT" | cut -d' ' -f1)"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "apk=$OUT"     >> "$GITHUB_OUTPUT"
+          echo "Verified $OUT ($(stat -c%s "$OUT") bytes, sha256 $SHA)"
+
+      # ---------------------------------------------------------------------
+      # Generate update.json via the tested script.
+      # ---------------------------------------------------------------------
+      - name: Generate update.json
+        working-directory: app-project
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          APK_NAME="${{ steps.verify.outputs.apk }}"
+          SHA="${{ steps.verify.outputs.sha256 }}"
+          APK_URL="https://github.com/${REPO}/releases/download/${TAG}/${APK_NAME}"
+
+          node ../tools/release-metadata.mjs manifest "$VERSION" "$APK_URL" "$SHA" \
+            > update.json
+
+          echo '--- update.json ---'
+          cat update.json
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: DSH Mobile ${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 安装
+
+            下载 `dsh-mobile-${{ steps.version.outputs.version }}.apk` 直接安装。
+
+            应用内更新会自动读取本页的 `update.json`，无需手动下载。
+
+            **SHA-256**：`${{ steps.verify.outputs.sha256 }}`
+          files: |
+            app-project/${{ steps.verify.outputs.apk }}
+            app-project/update.json

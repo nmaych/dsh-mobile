@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全问题
+    url: https://github.com/nmaych/dsh-mobile/security/advisories/new
+    about: 请用私密渠道报告漏洞，不要开公开 issue。
+  - name: 使用问题 / 讨论
+    url: https://github.com/nmaych/dsh-mobile/discussions
+    about: 怎么装、怎么连、怎么配，先在这里问。
+  - name: 连接不上桌面端
+    url: https://github.com/nmaych/dsh-mobile/blob/main/README.md#连接桌面端
+    about: 多数连接问题在 README 的这一节里已经写了。

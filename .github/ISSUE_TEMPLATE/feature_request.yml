@@ -1,0 +1,36 @@
+name: 功能建议
+description: 想要一个新的能力
+labels: ['enhancement']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 说场景，不要说方案。知道问题是什么，方案往往不止一种
+      placeholder: '例如：我经常在手机上看到一半，想切回电脑继续，但会话太多了找不到刚才那个'
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你设想的做法
+      description: 可选。如果你已经有想法
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你现在怎么绕过这个问题
+      description: 可选，但很有用——它说明这个问题有多值得解
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我搜过已有的 issue，没有重复
+          required: true

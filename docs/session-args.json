@@ -1,0 +1,205 @@
+[
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#fileReferences/list",
+    "service": "sessionFileReferences",
+    "namespace": "fileReferences",
+    "method": "list",
+    "mode": "unary",
+    "wires": [
+      "agentId",
+      "query"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/attachment",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "attachment",
+    "mode": "stream",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/cancel",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "cancel",
+    "mode": "stream",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/canOpenWorkspacePath",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "canOpenWorkspacePath",
+    "mode": "stream",
+    "wires": []
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/control",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "control",
+    "mode": "stream",
+    "wires": []
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/create",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "create",
+    "mode": "stream",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/follow",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "follow",
+    "mode": "stream",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/fork",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "fork",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/initializeDefaultModel",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "initializeDefaultModel",
+    "mode": "unary",
+    "wires": []
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/list",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "list",
+    "mode": "unary",
+    "wires": [
+      "_request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/modelCatalog",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "modelCatalog",
+    "mode": "unary",
+    "wires": []
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/openWorkspacePath",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "openWorkspacePath",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/page",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "page",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/projections",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "projections",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/prompt",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "prompt",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/rename",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "rename",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/search",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "search",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/selectModel",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "selectModel",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/updateQueue",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "updateQueue",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#session/workspacePathApplications",
+    "service": "sessionController",
+    "namespace": "session",
+    "method": "workspacePathApplications",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  },
+  {
+    "id": "@deepseek-ai/dsh-api-session-controller#skills/list",
+    "service": "sessionSkillCatalog",
+    "namespace": "skills",
+    "method": "list",
+    "mode": "unary",
+    "wires": [
+      "request"
+    ]
+  }
+]

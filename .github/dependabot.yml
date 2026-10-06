@@ -1,0 +1,28 @@
+# Keep the build honest: these are the things that, when they rot, rot quietly.
+version: 2
+updates:
+  # Gradle dependencies (AndroidX, Compose, OkHttp, coroutines).
+  - package-ecosystem: gradle
+    directory: /app-project
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      # Compose artifacts must move together; separate PRs for each would
+      # produce a broken tree on every other merge.
+      compose:
+        patterns:
+          - 'androidx.compose*'
+      androidx:
+        patterns:
+          - 'androidx.*'
+    commit-message:
+      prefix: 'chore(deps)'
+
+  # Pinned action versions in .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: 'chore(ci)'

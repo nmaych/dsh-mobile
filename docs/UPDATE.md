@@ -1,0 +1,141 @@
+# 应用内更新
+
+DSH Mobile 通过一个静态 JSON 清单检查新版本：下载 APK、校验 SHA-256、
+交给系统安装器。整个过程不需要应用商店。
+
+> 这份文档讲**清单格式和客户端行为**。
+> 维护者怎么发版、怎么配签名密钥，见 [RELEASING.md](RELEASING.md)。
+
+---
+
+## 默认地址
+
+应用默认读取本仓库最新 Release 的清单：
+
+```
+https://github.com/nmaych/dsh-mobile/releases/latest/download/update.json
+```
+
+因为地址里是 `latest`，**发一个新 Release 就够了**——所有已安装的应用
+下次检查更新时就会看到，不需要改代码或重新指向。
+
+---
+
+## 清单格式
+
+想自己托管的话，把这样一个文件放到任意可公开访问的 HTTPS 地址即可：
+
+```json
+{
+  "versionCode": 10100,
+  "versionName": "1.1.0",
+  "apkUrl": "https://example.com/dsh-mobile-1.1.0.apk",
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "notes": "新增：会话搜索；修复：长消息滚动卡顿。",
+  "mandatory": false
+}
+```
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `versionCode` | 是 | 整数。**必须大于**已安装版本的 `versionCode` 才会提示更新 |
+| `versionName` | 否 | 展示用 |
+| `apkUrl` | 是 | APK 直链 |
+| `sha256` | 建议 | APK 的 SHA-256，十六进制，大小写不限。留空则跳过校验 |
+| `notes` | 否 | 更新说明，显示在设置页 |
+| `mandatory` | 否 | 预留给强制更新，当前版本仅作记录 |
+
+在手机上：设置 → 应用更新 → 填写清单地址 → 检查更新。
+
+---
+
+## 版本号怎么算
+
+`versionCode` 由发布流程从 tag 推导，规则是 `major*10000 + minor*100 + patch`：
+
+| 版本 | versionCode |
+|---|---|
+| 1.0.0 | 10000 |
+| 1.1.0 | 10100 |
+| 1.2.3 | 10203 |
+| 2.0.0 | 20000 |
+
+这样它可读、单调递增，而且不会和 `versionName` 走散。
+
+> **这三个值必须一致**：APK 内部的 `versionCode`、文件名里的版本号、
+> 清单里的 `versionCode`。任何一个对不上，用户就会遇到「反复提示同一个更新」
+> 或者「永远收不到更新」。本项目的 `1.1.0` 首次发布踩过这个坑，
+> 所以现在发布流程里有一步专门校验。
+
+---
+
+## 安全说明
+
+- **`sha256` 请务必填写。** 下载完成后会重新计算哈希，不匹配就删除文件并报错，
+  **绝不会**把未校验的包交给安装器。
+- APK 通过 `FileProvider` 以 `content://` URI 传递，只授予读权限，不暴露文件路径。
+- 清单建议放 HTTPS。如果被篡改，攻击者可以改 `apkUrl`；但只要 `sha256` 对应的是
+  你自己的包，篡改就会被检出——哈希不匹配，更新直接失败。
+
+---
+
+## 常见问题
+
+**点了安装但没反应**
+
+首次需要「安装未知来源应用」权限。应用会检测到并跳到对应设置页，授权后回来再点一次。
+
+**提示校验失败**
+
+`sha256` 与实际文件不一致。最常见的原因是上传后 APK 被改动，或者清单里的哈希
+还是旧包的。重新计算并更新清单。
+
+**提示已是最新版本**
+
+清单里的 `versionCode` 没有大于已安装的版本。注意它必须**严格大于**，相等不算。
+
+**无法覆盖安装**
+
+签名不一致。Android 要求覆盖升级必须用同一个密钥签名。本仓库**不提供**签名密钥
+（见 [RELEASING.md](RELEASING.md)），所以：
+- 如果你从 Release 安装，就一直用 Release 的包升级，不要混装自己签的版本；
+- 如果你自己签过名，就必须一直用同一把密钥。
+
+密钥丢了只能卸载重装，本地设置会丢失。
+
+---
+
+## 本地验证更新流程
+
+不用真的传到网上，起一个本地静态服务器就行：
+
+```powershell
+# 1. 造一个「新版本」：用更大的版本号构建
+$env:DSH_VERSION_CODE = "10200"
+$env:DSH_VERSION_NAME = "1.2.0"
+build.cmd assembleRelease
+
+# 2. 算哈希
+$hash = (Get-FileHash app-project\app\build\outputs\apk\release\app-release.apk -Algorithm SHA256).Hash.ToLower()
+Write-Host $hash
+
+# 3. 写清单（把 APK 复制到同一目录）
+Copy-Item app-project\app\build\outputs\apk\release\app-release.apk .\app-release.apk
+@"
+{
+  "versionCode": 10200,
+  "versionName": "1.2.0",
+  "apkUrl": "http://192.168.1.5:8080/app-release.apk",
+  "sha256": "$hash",
+  "notes": "测试更新流程"
+}
+"@ | Out-File -Encoding utf8 update.json
+
+# 4. 起服务器（IP 要换成手机能访问到的那个）
+python -m http.server 8080
+```
+
+然后把手机设置里的清单地址改成 `http://192.168.1.5:8080/update.json`，点检查更新。
+
+> 用 HTTP 而不是 HTTPS 是没问题的：`network_security_config.xml` 允许明文，
+> 因为桌面端本身就跑在局域网 HTTP 上。但生产环境的清单建议用 HTTPS。

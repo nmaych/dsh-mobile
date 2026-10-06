@@ -1,0 +1,168 @@
+﻿total descriptors: 134
+namespaces (29): account, agentPresets, commands, credentials, directoryPicker, dynamicCordisRunner, fileReferences, fileUploads, goals, job, llm, messageFeedback, officeToPdf, permissionPresets, pluginInventory, pluginManager, pluginRegistryProbe, productAnalytics, schedule, session, sessionFeedback, sessionReferenceResolver, settings, skills, subagents, terminal, userQuestions, workspace, workspaceFiles
+
+## account
+            account/ackBonusNotified
+            account/cancelSignIn
+            account/getBalance
+            account/getProfile
+            account/getState
+            account/getUnnotifiedBonuses
+            account/hasRunningAccountTasks
+            account/signOut
+            account/startSignIn
+   [stream] account/watch
+   [stream] account/watchExpiry
+## agentPresets
+            agentPresets/list
+            agentPresets/read
+            agentPresets/select
+## commands
+            commands/execute
+            commands/list
+## credentials
+            credentials/describe
+            credentials/set
+            credentials/unset
+## directoryPicker
+            directoryPicker/createDirectory
+            directoryPicker/list
+            directoryPicker/pick
+## dynamicCordisRunner
+            dynamicCordisRunner/getClientCode
+            dynamicCordisRunner/inventory
+            dynamicCordisRunner/invoke
+            dynamicCordisRunner/reportClientGuardFailure
+            dynamicCordisRunner/reportRenderFailure
+            dynamicCordisRunner/resolveInspectQuery
+            dynamicCordisRunner/resolveRequestRun
+            dynamicCordisRunner/runHostHalf
+            dynamicCordisRunner/settleUserRun
+            dynamicCordisRunner/stopFromPanel
+            dynamicCordisRunner/syncInspectManifest
+            dynamicCordisRunner/undefineFromPanel
+## fileReferences
+            fileReferences/list
+## fileUploads
+            fileUploads/upload
+## goals
+            goals/clear
+            goals/complete
+            goals/create
+            goals/edit
+            goals/get
+            goals/pause
+            goals/resume
+## job
+   [stream] job/follow
+            job/kill
+   [stream] job/list
+## llm
+            llm/discoverModels
+            llm/listConfigurableProviders
+            llm/listProviders
+## messageFeedback
+            messageFeedback/delete
+            messageFeedback/list
+            messageFeedback/put
+## officeToPdf
+            officeToPdf/generation
+            officeToPdf/render
+## permissionPresets
+            permissionPresets/catalog
+## pluginInventory
+            pluginInventory/list
+## pluginManager
+            pluginManager/cancelInstall
+            pluginManager/inspect
+            pluginManager/installBundle
+            pluginManager/listBundles
+            pluginManager/listPlugins
+            pluginManager/listVersionExemptions
+            pluginManager/registries
+            pluginManager/removeBundle
+            pluginManager/setBundleEnabled
+            pluginManager/setPluginEnabled
+            pluginManager/setVersionExemption
+            pluginManager/waitForInstall
+## pluginRegistryProbe
+            pluginRegistryProbe/fastest
+## productAnalytics
+            productAnalytics/enabled
+            productAnalytics/report
+   [stream] productAnalytics/watchPolicy
+## schedule
+            schedule/catalog
+            schedule/delete
+            schedule/history
+            schedule/list
+            schedule/update
+## session
+            session/attachment
+            session/cancel
+            session/canOpenWorkspacePath
+   [stream] session/control
+            session/create
+   [stream] session/follow
+            session/fork
+            session/initializeDefaultModel
+            session/list
+            session/modelCatalog
+            session/openWorkspacePath
+            session/page
+            session/projections
+            session/prompt
+            session/rename
+            session/search
+            session/selectModel
+            session/updateQueue
+            session/workspacePathApplications
+## sessionFeedback
+            sessionFeedback/record
+## sessionReferenceResolver
+            sessionReferenceResolver/candidates
+## settings
+            settings/describe
+            settings/mutate
+            settings/openSettingsDocument
+            settings/replace
+            settings/update
+## skills
+            skills/list
+## subagents
+            subagents/interruptByParent
+            subagents/prompt
+## terminal
+            terminal/close
+            terminal/create
+            terminal/environment
+   [stream] terminal/follow
+            terminal/list
+            terminal/rename
+            terminal/resize
+   [stream] terminal/retain
+            terminal/shells
+            terminal/write
+## userQuestions
+            userQuestions/answer
+   [stream] userQuestions/attachWait
+## workspace
+            workspace/archiveSession
+            workspace/create
+            workspace/delete
+   [stream] workspace/follow
+            workspace/initializeDefault
+            workspace/insertBefore
+            workspace/insertSessionBefore
+            workspace/pinSession
+            workspace/rename
+            workspace/unarchiveSession
+            workspace/unpinSession
+## workspaceFiles
+   [stream] workspaceFiles/changes
+            workspaceFiles/list
+            workspaceFiles/read
+            workspaceFiles/readBytes
+            workspaceFiles/stat
+
+written: E:\deepseekworkspace\dsh-android\docs\rpc-methods.json

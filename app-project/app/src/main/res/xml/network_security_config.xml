@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DSH Mobile talks to a Harness instance that usually lives on the LAN or on a
+  Tailscale/WireGuard address, over plain HTTP. Cleartext therefore has to stay
+  enabled; the app never sends credentials it does not own.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>
