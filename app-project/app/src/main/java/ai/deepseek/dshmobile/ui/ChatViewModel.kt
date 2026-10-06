@@ -56,7 +56,7 @@ data class ChatUiState(
     /** True while scanning the LAN for a desktop. */
     val searching: Boolean = false,
     val discovered: List<DiscoveredServer> = emptyList(),
-    /** True when the current connection goes through the dsh-connect gateway. */
+    /** True when the current connection goes through the dsh-mobile-connect gateway. */
     val viaGateway: Boolean = false,
 )
 
@@ -110,7 +110,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     // ----------------------------------------------------------------- pairing
 
     /**
-     * Pair with the `dsh-connect` gateway using the 6-digit code the desktop
+     * Pair with the `dsh-mobile-connect` gateway using the 6-digit code the desktop
      * shows. This is the supported way to connect: no port forwarding, and the
      * phone never handles a Harness session.
      */
@@ -139,6 +139,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     connecting = false,
                     connected = true,
                     backend = Backend.REMOTE,
+                    // Mark the transport, not just the fact of being connected.
+                    // The settings screen branches on `viaGateway` to decide
+                    // between "already paired" and "show the pairing form", so
+                    // leaving it false here made a *successful* pairing still
+                    // render the code/address form — as if it had not worked.
+                    viaGateway = true,
                     info = "已连接到 $origin",
                 )
                 refreshSessions()
@@ -150,6 +156,46 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
+    }
+
+    /**
+     * Pair using the link carried by the desktop's QR code.
+     *
+     * Format: `dshmobile://pair?host=…&port=…&code=…`
+     *
+     * This is the whole point of the QR: scanning it should connect, rather than
+     * making the user read an address and a six-digit code off a terminal and
+     * type both. A malformed link is reported rather than ignored, because a
+     * silent no-op after scanning looks like the app is broken.
+     */
+    fun pairFromLink(link: String) {
+        val uri = runCatching { java.net.URI(link) }.getOrNull()
+        if (uri == null || !uri.scheme.equals("dshmobile", true) || !uri.host.equals("pair", true)) {
+            _state.value = _state.value.copy(error = "这个二维码不是配对码，无法识别。")
+            return
+        }
+
+        val params = uri.rawQuery.orEmpty()
+            .split('&')
+            .mapNotNull { part ->
+                val i = part.indexOf('=')
+                if (i <= 0) null else part.substring(0, i) to part.substring(i + 1)
+            }
+            .toMap()
+
+        val host = params["host"]?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+        val port = params["port"]
+        val code = params["code"]?.trim()
+
+        if (host.isNullOrBlank() || code.isNullOrBlank()) {
+            _state.value = _state.value.copy(
+                error = "二维码里缺少连接地址或配对码，请让电脑重新生成一个。",
+            )
+            return
+        }
+
+        val address = if (port.isNullOrBlank()) host else "$host:$port"
+        pairWithCode(address, code)
     }
 
     /** Scan the local network for a desktop running the plugin. */
@@ -170,7 +216,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     searching = false,
                     discovered = found.map { DiscoveredServer(it.baseUrl, it.info.name, it.info.deviceCount) },
                     error = if (found.isEmpty()) {
-                        "没有找到桌面端。请确认电脑上已启用 dsh-connect，且与手机在同一个 Wi-Fi。"
+                        "没有找到桌面端。请确认电脑上已启用 dsh-mobile-connect，且与手机在同一个 Wi-Fi。"
                     } else {
                         null
                     },

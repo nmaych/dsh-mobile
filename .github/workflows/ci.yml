@@ -44,6 +44,12 @@ jobs:
       - name: Test release metadata
         run: node test/release-logic.test.mjs
 
+      # Guards the wire contract with the dsh-mobile-connect desktop plugin.
+      # A renamed endpoint is invisible to the Kotlin compiler but makes the
+      # app unable to pair at all, which is exactly what shipped in 1.1.0.
+      - name: Test gateway contract
+        run: node test/gateway-contract.test.mjs
+
   build:
     name: Assemble debug
     runs-on: ubuntu-latest

@@ -12,7 +12,7 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * Client for the `dsh-connect` plugin's LAN gateway.
+ * Client for the `dsh-mobile-connect` plugin's LAN gateway.
  *
  * The gateway is a small server the desktop plugin runs in front of `dsh web`.
  * It exists because `dsh web` binds loopback only, so a phone cannot reach it
@@ -26,7 +26,7 @@ class GatewayClient {
         .readTimeout(15, TimeUnit.SECONDS)
         .build()
 
-    /** What `GET /.dsh-connect/info` reports about a reachable gateway. */
+    /** What `GET /.dsh-mobile-connect/info` reports about a reachable gateway. */
     data class Info(
         val service: String,
         val version: String,
@@ -48,13 +48,13 @@ class GatewayClient {
     suspend fun probe(baseUrl: String): Info? = withContext(Dispatchers.IO) {
         val base = baseUrl.trim().trimEnd('/')
         runCatching {
-            val req = Request.Builder().url("$base/.dsh-connect/info").get().build()
+            val req = Request.Builder().url("$base/.dsh-mobile-connect/info").get().build()
             http.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use null
                 val body = JSONObject(resp.body?.string().orEmpty())
-                if (body.optString("service") != "dsh-connect") return@use null
+                if (body.optString("service") != "dsh-mobile-connect") return@use null
                 Info(
-                    service = "dsh-connect",
+                    service = "dsh-mobile-connect",
                     version = body.optString("version", "?"),
                     name = body.optString("name", "DSH Harness"),
                     deviceCount = body.optInt("deviceCount", 0),
@@ -78,7 +78,7 @@ class GatewayClient {
                 .toString()
 
             val req = Request.Builder()
-                .url("$base/.dsh-connect/pair")
+                .url("$base/.dsh-mobile-connect/pair")
                 .post(payload.toRequestBody(JSON))
                 .build()
 
@@ -89,7 +89,7 @@ class GatewayClient {
             }.getOrElse {
                 throw GatewayException(
                     "连接不上 ${base}。请确认手机和电脑在同一个 Wi-Fi，" +
-                        "并且电脑上已启用 dsh-connect。",
+                        "并且电脑上已启用 dsh-mobile-connect。",
                     "unreachable",
                 )
             }

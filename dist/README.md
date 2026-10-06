@@ -24,16 +24,16 @@ build.cmd assembleRelease
 想在这里留一份，自己复制过来即可：
 
 ```powershell
-$v = "1.1.0"
+$v = "1.1.1"
 Copy-Item app-project\app\build\outputs\apk\release\app-release.apk "dist\dsh-mobile-$v.apk"
-$hash = (Get-FileHash "dist\dsh-mobile-$v.apk" -Algorithm SHA256).Hash.ToLower()
-node tools/release-metadata.mjs manifest $v `
-  "https://github.com/nmaych/dsh-mobile/releases/download/v$v/dsh-mobile-$v.apk" `
-  $hash | Out-File -Encoding utf8 dist\update.json
+node tools/write-dist-manifest.mjs $v "dist\dsh-mobile-$v.apk" `
+  "https://github.com/nmaych/dsh-mobile/releases/download/v$v/dsh-mobile-$v.apk"
 ```
 
-第二条命令用的是发布流程同一套逻辑，所以本地清单和线上清单的算法一致。
+`write-dist-manifest.mjs` 自己算 SHA-256、自己从 `CHANGELOG.md` 抓更新说明，
+调的是发布流程同一个 `buildManifest()`，所以本地清单和线上清单的算法一致。
 
-> 用 `Out-File -Encoding utf8` 写 JSON 时，Windows PowerShell 会带一个 BOM。
-> 本项目的更新解析器能容忍它，但如果你要拿这个文件喂给别的工具，
-> 用 `[System.IO.File]::WriteAllText()` 或 `Set-Content -Encoding utf8NoBOM` 更稳妥。
+> 不要用 `node tools/release-metadata.mjs manifest … | Out-File dist\update.json`
+> 这种写法。PowerShell 会把命令输出按行拆成数组再拼回去，结果 JSON 被压成
+> 一行；`Out-File -Encoding utf8` 还会额外写一个 BOM。上面这个脚本直接写文件，
+> 两个问题都没有。

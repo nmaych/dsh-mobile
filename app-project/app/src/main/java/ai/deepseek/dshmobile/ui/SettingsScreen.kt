@@ -177,7 +177,7 @@ fun SettingsScreen(
                         )
                     } else {
                         Text(
-                            "先在电脑上装好 dsh-connect 插件。启动后桌面端会显示一个配对码。",
+                            "先在电脑上装好 dsh-mobile-connect 插件。启动后桌面端会显示一个配对码。",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             lineHeight = 17.sp,
@@ -208,7 +208,16 @@ fun SettingsScreen(
                             Spacer(Modifier.height(8.dp))
                             for (server in state.discovered) {
                                 Surface(
-                                    onClick = { onPickServer(server.baseUrl) },
+                                    onClick = {
+                                        // Fill the field as well as storing the
+                                        // choice. Picking a desktop is exactly
+                                        // "use this address", and the address
+                                        // box is what the 连接 button reads, so
+                                        // a tap that only stored the value left
+                                        // the button disabled on a blank field.
+                                        address = server.baseUrl
+                                        onPickServer(server.baseUrl)
+                                    },
                                     color = MaterialTheme.colorScheme.surfaceVariant,
                                     shape = RoundedCornerShape(8.dp),
                                     modifier = Modifier

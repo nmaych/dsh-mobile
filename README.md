@@ -49,21 +49,21 @@
 
 ## 连接桌面端
 
-### 第一步：在电脑上装 dsh-connect 插件
+### 第一步：在电脑上装 dsh-mobile-connect 插件
 
-手机连桌面端走的是配套插件 **dsh-connect**（独立仓库：
-[`nmaych/dsh-connect`](https://github.com/nmaych/dsh-connect)）。它在电脑上开一个
+手机连桌面端走的是配套插件 **dsh-mobile-connect**（独立仓库：
+[`nmaych/dsh-mobile-connect`](https://github.com/nmaych/dsh-mobile-connect)）。它在电脑上开一个
 **有认证的**局域网入口，取代手工端口转发。
 
 ```sh
-dsh plugin add dsh-connect
+dsh plugin add dsh-mobile-connect
 dsh web
 ```
 
 启动后终端会多出一块面板：
 
 ```
-┌─ DSH Connect ──────────────────────────────────────────────┐
+┌─ DSH Mobile Connect ──────────────────────────────────────────────┐
 │ 手机连接地址  http://192.168.1.5:19387                      │
 │ 配对码        021088                                        │
 │ 有效期        10 分钟                                        │
@@ -222,7 +222,7 @@ dsh-mobile/
 │       │   └── SessionParser.kt     会话事件 → 消息模型
 │       ├── net/
 │       │   ├── ChatApi.kt           OpenAI 兼容接口客户端
-│       │   └── GatewayClient.kt     dsh-connect 网关客户端（配对、发现）
+│       │   └── GatewayClient.kt     dsh-mobile-connect 网关客户端（配对、发现）
 │       ├── ui/
 │       │   ├── ChatViewModel.kt     状态与业务逻辑
 │       │   ├── ChatScreen.kt        聊天界面

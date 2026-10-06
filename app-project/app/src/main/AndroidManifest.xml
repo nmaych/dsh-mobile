@@ -24,9 +24,24 @@
             android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
             android:theme="@style/Theme.DshMobile">
+
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                Pairing link carried by the QR code the desktop prints:
+                    dshmobile://pair?host=192.168.1.5&port=19387&code=021088
+
+                Without this filter the QR is decorative: scanning it would open
+                nothing, and the address and code would have to be typed by hand.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="dshmobile" android:host="pair" />
             </intent-filter>
         </activity>
 

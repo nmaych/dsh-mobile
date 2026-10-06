@@ -56,7 +56,7 @@ class Prefs(context: Context) {
         set(v) = sp.edit { putString(KEY_SERVER_NAME, v) }
 
     /**
-     * Device token issued by the `dsh-connect` plugin on the desktop.
+     * Device token issued by the `dsh-mobile-connect` plugin on the desktop.
      *
      * When this is set the app talks to the plugin's LAN gateway instead of the
      * Harness directly. That is the supported path: the gateway holds the

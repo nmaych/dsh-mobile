@@ -119,7 +119,7 @@ class DshClient(private val prefs: Prefs) {
     // -------------------------------------------------------------- transport
 
     /**
-     * Whether this origin is reached through the `dsh-connect` LAN gateway.
+     * Whether this origin is reached through the `dsh-mobile-connect` LAN gateway.
      *
      * The two paths differ only in how the request is authorised: through the
      * gateway the phone presents a device token and the gateway supplies the
