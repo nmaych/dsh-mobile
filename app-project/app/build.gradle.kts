@@ -10,19 +10,22 @@ plugins {
 //
 // Defaults live here so a local build needs no setup. CI overrides them from
 // the git tag (`DSH_VERSION_CODE` / `DSH_VERSION_NAME`), which keeps the tag,
-// the APK metadata and the update manifest from drifting apart — they have
+// the APK metadata and the update manifest from drifting apart 鈥?they have
 // drifted before, and the symptom is an update prompt that never goes away.
+//
+// Keep these in step with the newest CHANGELOG entry: the scheme is
+// major*10000 + minor*100 + patch, so 1.1.0 is 10100. See docs/RELEASING.md.
 // ---------------------------------------------------------------------------
-val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "1").toIntOrNull()
+val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10100").toIntOrNull()
     ?: error("DSH_VERSION_CODE must be an integer")
-val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.0.0"
+val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.1.0"
 
 // ---------------------------------------------------------------------------
 // Release signing.
 //
 // Two sources, tried in order:
-//   1. Environment variables — what CI uses, fed from repository secrets.
-//   2. `keystore.properties` beside this file — what a local release uses.
+//   1. Environment variables 鈥?what CI uses, fed from repository secrets.
+//   2. `keystore.properties` beside this file 鈥?what a local release uses.
 //
 // When neither is present the release build stays unsigned rather than failing:
 // `assembleDebug` and CI compile checks must work on a fresh clone.

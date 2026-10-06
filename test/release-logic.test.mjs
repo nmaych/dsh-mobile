@@ -155,6 +155,47 @@ check('manifest versionCode matches the version string', () => {
   assert.equal(manifest.versionName, '1.1.0')
 })
 
+// ------------------------------------------------------- source consistency
+
+console.log('\n=== build.gradle.kts stays in step with CHANGELOG.md ===')
+
+const gradlePath = path.join(
+  here,
+  '..',
+  'app-project',
+  'app',
+  'build.gradle.kts',
+)
+
+check('the Gradle default version matches the newest CHANGELOG entry', () => {
+  const gradle = fs.readFileSync(gradlePath, 'utf8')
+
+  const codeMatch = /System\.getenv\("DSH_VERSION_CODE"\)\s*\?:\s*"(\d+)"/.exec(gradle)
+  const nameMatch = /System\.getenv\("DSH_VERSION_NAME"\)\s*\?:\s*"([^"]+)"/.exec(gradle)
+  assert.ok(codeMatch, 'could not find the DSH_VERSION_CODE default in build.gradle.kts')
+  assert.ok(nameMatch, 'could not find the DSH_VERSION_NAME default in build.gradle.kts')
+
+  const [, defaultCode, defaultName] = [null, codeMatch[1], nameMatch[1]]
+
+  // Newest = first version heading in the file.
+  const newest = /^## \[(\d+\.\d+\.\d+)\]/m.exec(markdown)
+  assert.ok(newest, 'CHANGELOG.md has no version heading')
+  const newestVersion = newest[1]
+
+  assert.equal(
+    defaultName,
+    newestVersion,
+    `build.gradle.kts defaults to ${defaultName} but the newest CHANGELOG entry is ${newestVersion}. ` +
+      'Update the default so a plain local build matches the latest release.',
+  )
+  assert.equal(
+    Number(defaultCode),
+    versionCodeOf(newestVersion),
+    `build.gradle.kts default versionCode ${defaultCode} does not match ` +
+      `${newestVersion} -> ${versionCodeOf(newestVersion)}`,
+  )
+})
+
 // ------------------------------------------------------------------ report
 
 console.log()
