@@ -2,14 +2,24 @@
 # Secrets. These must never be committed.
 #
 #   keystore.properties   holds the signing passwords in plaintext
-#   *.jks / *.keystore    the signing key itself; leaking it lets anyone ship
+#   keystore/             the signing key itself; leaking it lets anyone ship
 #                         an "update" that Android will happily install over
 #                         yours, so this one matters more than the password
 #   local.properties      machine-specific SDK path, rewritten by every IDE
+#
+# The whole `keystore/` directory is ignored, not just `*.jks`. A key in any
+# other format (.p12, .pem, .b64) or a stray note with a password in it would
+# otherwise slip through — and this is the one directory where that mistake is
+# unrecoverable once pushed.
 # ---------------------------------------------------------------------------
-keystore.properties
+keystore/
 *.jks
 *.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+keystore.properties
 local.properties
 .env
 .env.*
