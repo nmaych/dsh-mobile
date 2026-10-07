@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import ai.deepseek.dshmobile.BuildConfig
+import ai.deepseek.dshmobile.net.TransportErrors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -71,9 +72,18 @@ class UpdateManager(private val context: Context) {
     /** Fetch and parse the manifest; null when the app is already current. */
     suspend fun check(manifestUrl: String): UpdateInfo? = withContext(Dispatchers.IO) {
         val req = Request.Builder().url(manifestUrl).header("Cache-Control", "no-cache").get().build()
-        client.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw RuntimeException("检查更新失败：HTTP ${resp.code}")
+        // A failed connect would otherwise reach the settings screen as OkHttp's
+        // own "failed to connect to /… (port …) … after 20000ms".
+        val resp = try {
+            client.newCall(req).execute()
+        } catch (t: Throwable) {
+            throw RuntimeException(
+                TransportErrors.message(manifestUrl, t, TransportErrors.INTERNET_HINT)
+            )
+        }
+        resp.use { response ->
+            val text = response.body?.string().orEmpty()
+            if (!response.isSuccessful) throw RuntimeException("检查更新失败：HTTP ${response.code}")
             val o = JSONObject(text)
             val code = o.optInt("versionCode", 0)
             val info = UpdateInfo(
@@ -99,12 +109,22 @@ class UpdateManager(private val context: Context) {
         val partial = File(dir, "${target.name}.part")
 
         val req = Request.Builder().url(info.apkUrl).get().build()
-        client.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) {
-                emit(UpdateState.Failed("下载失败：HTTP ${resp.code}"))
+        val resp = try {
+            client.newCall(req).execute()
+        } catch (t: Throwable) {
+            emit(
+                UpdateState.Failed(
+                    TransportErrors.message(info.apkUrl, t, TransportErrors.INTERNET_HINT)
+                )
+            )
+            return@flow
+        }
+        resp.use { response ->
+            if (!response.isSuccessful) {
+                emit(UpdateState.Failed("下载失败：HTTP ${response.code}"))
                 return@flow
             }
-            val body = resp.body ?: run {
+            val body = response.body ?: run {
                 emit(UpdateState.Failed("下载失败：响应为空"))
                 return@flow
             }

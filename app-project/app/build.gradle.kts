@@ -14,11 +14,11 @@ plugins {
 // drifted before, and the symptom is an update prompt that never goes away.
 //
 // Keep these in step with the newest CHANGELOG entry: the scheme is
-// major*10000 + minor*100 + patch, so 1.1.1 is 10101. See docs/RELEASING.md.
+// major*10000 + minor*100 + patch, so 1.1.3 is 10103. See docs/RELEASING.md.
 // ---------------------------------------------------------------------------
-val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10101").toIntOrNull()
+val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10103").toIntOrNull()
     ?: error("DSH_VERSION_CODE must be an integer")
-val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.1.1"
+val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.1.3"
 
 // ---------------------------------------------------------------------------
 // Release signing.

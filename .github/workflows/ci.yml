@@ -50,6 +50,25 @@ jobs:
       - name: Test gateway contract
         run: node test/gateway-contract.test.mjs
 
+      # Guards the wire names behind workspace selection, model switching and
+      # token usage. The gateway rejects an args object whose keys do not match
+      # the descriptor exactly, so a typo there ships as a feature that silently
+      # does nothing.
+      - name: Test feature contract
+        run: node test/feature-contract.test.mjs
+
+      # Guards the transcript fold — the logic behind "对话显示异常". The event
+      # shapes are taken from real session logs, and the per-session lifetime of
+      # the dedupe set and tool-call index is what the fix turned on.
+      - name: Test session fold
+        run: node test/session-fold.test.mjs
+
+      # Guards the three 1.1.3 fixes, all of which compiled fine while broken:
+      # transport failures rendering as raw English, a subagent child addressed
+      # as a top-level session, and the chip strip collapsing into a column.
+      - name: Test 1.1.3 regressions
+        run: node test/regression-1.1.3.test.mjs
+
   build:
     name: Assemble debug
     runs-on: ubuntu-latest

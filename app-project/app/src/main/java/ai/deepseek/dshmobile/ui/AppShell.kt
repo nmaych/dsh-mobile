@@ -2,12 +2,10 @@ package ai.deepseek.dshmobile.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -42,6 +40,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ai.deepseek.dshmobile.data.Backend
+import ai.deepseek.dshmobile.ui.components.ModelPickerDialog
+import ai.deepseek.dshmobile.ui.components.WorkspaceDrawerRow
+import ai.deepseek.dshmobile.ui.components.WorkspacePickerDialog
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -63,7 +65,7 @@ fun AppShell(
     onOpenSession: (String) -> Unit,
     onRefresh: () -> Unit,
     onDismissError: () -> Unit,
-    onBackendChange: (ai.deepseek.dshmobile.data.Backend) -> Unit,
+    onBackendChange: (Backend) -> Unit,
     onPair: (String) -> Unit,
     onPairWithCode: (String, String) -> Unit,
     onDiscover: () -> Unit,
@@ -73,11 +75,18 @@ fun AppShell(
     onApiConfigChange: (String, String, String, String) -> Unit,
     onLoadModels: () -> Unit,
     onSelectModel: (String) -> Unit,
+    onLoadRemoteModels: () -> Unit,
+    onSelectRemoteModel: (String, String, String?) -> Unit,
+    onRefreshWorkspaces: () -> Unit,
+    onSelectWorkspace: (String) -> Unit,
+    onAddWorkspace: (String) -> Unit,
     onUpdateManifestChange: (String) -> Unit,
     onCheckUpdate: () -> Unit,
     onInstallUpdate: () -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
+    var showModelPicker by remember { mutableStateOf(false) }
+    var showWorkspacePicker by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
@@ -109,6 +118,46 @@ fun AppShell(
         return
     }
 
+    // Opening the picker is what fetches the catalog. Doing this in the click
+    // handler rather than a `LaunchedEffect` keyed on "the list is empty" avoids
+    // a retry loop: a failed fetch leaves the list empty, which would re-enter
+    // the effect and fire again, forever.
+    val openModelPicker = {
+        showModelPicker = true
+        if (state.remoteModels.isEmpty()) onLoadRemoteModels()
+    }
+
+    if (showModelPicker) {
+        ModelPickerDialog(
+            models = state.remoteModels,
+            currentModel = state.activeModel,
+            currentEffort = state.activeEffort,
+            loading = state.loadingModels,
+            onDismiss = { showModelPicker = false },
+            onLoad = onLoadRemoteModels,
+            onPick = { provider, model, effort ->
+                showModelPicker = false
+                onSelectRemoteModel(provider, model, effort)
+            },
+        )
+    }
+
+    if (showWorkspacePicker) {
+        WorkspacePickerDialog(
+            workspaces = state.workspaces,
+            selectedId = state.selectedWorkspaceId,
+            activeId = state.activeWorkspaceId,
+            loading = state.loadingWorkspaces,
+            onDismiss = { showWorkspacePicker = false },
+            onReload = onRefreshWorkspaces,
+            onPick = {
+                onSelectWorkspace(it)
+                showWorkspacePicker = false
+            },
+            onAdd = onAddWorkspace,
+        )
+    }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
@@ -127,6 +176,7 @@ fun AppShell(
                     showSettings = true
                     scope.launch { drawerState.close() }
                 },
+                onOpenWorkspacePicker = { showWorkspacePicker = true },
             )
         },
     ) {
@@ -139,12 +189,14 @@ fun AppShell(
             onNewSession = onNewSession,
             onRefresh = onRefresh,
             onDismissError = onDismissError,
+            onOpenModelPicker = openModelPicker,
+            onOpenWorkspacePicker = { showWorkspacePicker = true },
         )
     }
 
     // Ask the drawer to refresh the first time it becomes usable.
     LaunchedEffect(state.backend, state.connected) {
-        if (state.backend == ai.deepseek.dshmobile.data.Backend.REMOTE && state.connected) {
+        if (state.backend == Backend.REMOTE && state.connected) {
             onRefresh()
         }
     }
@@ -162,6 +214,7 @@ private fun SessionDrawer(
     onOpenSession: (String) -> Unit,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenWorkspacePicker: () -> Unit,
 ) {
     ModalDrawerSheet(
         drawerContainerColor = MaterialTheme.colorScheme.surface,
@@ -186,12 +239,24 @@ private fun SessionDrawer(
             }
             Text(
                 when {
-                    state.backend != ai.deepseek.dshmobile.data.Backend.REMOTE -> "当前为独立 API 模式"
+                    state.backend != Backend.REMOTE -> "当前为独立 API 模式"
                     !state.connected -> "未连接桌面端"
                     else -> "已连接 · ${state.sessions.size} 个会话"
                 },
                 fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        // The workspace is where the next new session lands, so it belongs next
+        // to the "+" it affects rather than only inside settings.
+        if (state.backend == Backend.REMOTE && state.connected) {
+            HorizontalDivider(color = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f))
+            val selected = state.workspaces.firstOrNull { it.id == state.selectedWorkspaceId }
+            WorkspaceDrawerRow(
+                label = selected?.label ?: "默认工作区",
+                path = selected?.path ?: "新建会话时由桌面端决定目录",
+                onClick = onOpenWorkspacePicker,
             )
         }
 
@@ -205,7 +270,7 @@ private fun SessionDrawer(
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    if (state.backend == ai.deepseek.dshmobile.data.Backend.REMOTE) {
+                    if (state.backend == Backend.REMOTE) {
                         "暂无会话。\n在桌面端开始一个对话，或点右上角 + 新建。"
                     } else {
                         "独立 API 模式不使用桌面端会话。"

@@ -33,6 +33,72 @@ data class Message(
 }
 
 /**
+ * Provider-reported token accounting for one attempt or a whole session.
+ *
+ * The Harness reports `inputTokens` as the **uncached** prompt side; cache reads
+ * and writes are counted separately so a cached prompt does not look free. The
+ * projection surface names the same field `uncachedInputTokens`, which is why
+ * [fromProjection] and [fromUsage] read different keys for the same number.
+ */
+data class TokenUsage(
+    val inputTokens: Long = 0L,
+    val outputTokens: Long = 0L,
+    val cacheReadTokens: Long = 0L,
+    val cacheWriteTokens: Long = 0L,
+) {
+    /** Every billed bucket, which is what "total tokens" means to a user. */
+    val total: Long get() = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens
+
+    val isEmpty: Boolean get() = total == 0L
+
+    operator fun plus(other: TokenUsage): TokenUsage = TokenUsage(
+        inputTokens = inputTokens + other.inputTokens,
+        outputTokens = outputTokens + other.outputTokens,
+        cacheReadTokens = cacheReadTokens + other.cacheReadTokens,
+        cacheWriteTokens = cacheWriteTokens + other.cacheWriteTokens,
+    )
+
+    companion object {
+        /**
+         * Read the live `usage` stream chunk / `assistant/message.data.usage`
+         * shape: `{inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens?}`.
+         */
+        fun fromUsage(o: JSONObject?): TokenUsage? {
+            if (o == null) return null
+            if (!o.has("inputTokens") && !o.has("outputTokens")) return null
+            return TokenUsage(
+                inputTokens = o.optLong("inputTokens", 0L),
+                outputTokens = o.optLong("outputTokens", 0L),
+                cacheReadTokens = o.optLong("cacheReadTokens", 0L),
+                cacheWriteTokens = o.optLong("cacheWriteTokens", 0L),
+            )
+        }
+
+        /**
+         * Read the `tokenUsage` session projection, which is the session's
+         * running total rather than one attempt.
+         */
+        fun fromProjection(o: JSONObject?): TokenUsage? {
+            if (o == null) return null
+            return TokenUsage(
+                inputTokens = o.optLong("uncachedInputTokens", 0L),
+                outputTokens = o.optLong("outputTokens", 0L),
+                cacheReadTokens = o.optLong("cacheReadTokens", 0L),
+                cacheWriteTokens = o.optLong("cacheWriteTokens", 0L),
+            )
+        }
+    }
+}
+
+/**
+ * `callId -> (messageIndex, blockIndex)` for one session's transcript.
+ *
+ * Shared across `fold` batches: a tool result lands in a later batch than the
+ * call that created its card.
+ */
+typealias CallIndex = MutableMap<String, Pair<Int, Int>>
+
+/**
  * Parser for the Harness session event log.
  *
  * The Harness writes a rich, append-only event log; a client renders a subset of
@@ -56,7 +122,15 @@ object SessionParser {
         val lastSeq: Long,
         /** Turn number of the currently open turn, or null. */
         val openTurn: Int?,
+        /** Provider usage reported by the assistant settlements in this batch. */
+        val usage: TokenUsage?,
+        /** `provider/model` of the newest assistant settlement, when present. */
+        val model: String?,
     )
+
+    /** Where a `tool/result` can find the card its `tool/call` created. */
+    // (The `CallIndex` alias is declared at file scope: Kotlin does not allow a
+    // typealias nested inside an object.)
 
     // ------------------------------------------------------------ item frames
 
@@ -82,22 +156,46 @@ object SessionParser {
     fun cursorOf(item: JSONObject): Long? =
         if (item.optString("type") == "snapshot") item.optLong("cursor", -1L) else null
 
+    /**
+     * `provider/model` from a `session/list` row's `modelSelection` projection.
+     *
+     * `next` is the pending choice and `lastUsed` is what the previous turn
+     * actually ran with; `next` wins when both are present.
+     */
+    fun modelSelectionOf(projections: JSONObject?): String? {
+        val selection = projections?.optJSONObject("values")?.optJSONObject("modelSelection")
+            ?: return null
+        val chosen = selection.optJSONObject("next") ?: selection.optJSONObject("lastUsed")
+            ?: return null
+        val provider = chosen.optString("provider")
+        val model = chosen.optString("model")
+        if (provider.isBlank() || model.isBlank()) return null
+        return "$provider/$model"
+    }
+
     // ------------------------------------------------------------------- fold
 
     /**
      * Fold durable events into a transcript.
      *
      * @param previous messages already rendered, so folding is incremental.
+     * @param callIndex carries `callId -> (messageIndex, blockIndex)` **across
+     *   batches**. It must be the same map for the whole session: a live turn
+     *   commits `assistant/message` and its `tool/result` in different batches,
+     *   and a per-call index would fail to find the card the call created and
+     *   render the result as a second, duplicate card.
      */
-    fun fold(events: List<JSONObject>, previous: List<Message> = emptyList()): Folded {
+    fun fold(
+        events: List<JSONObject>,
+        previous: List<Message> = emptyList(),
+        callIndex: CallIndex = mutableMapOf(),
+    ): Folded {
         val out = previous.toMutableList()
         var title: String? = null
         var lastSeq = 0L
         var openTurn: Int? = null
-
-        // callId -> (messageIndex, blockIndex), so a tool result can be folded
-        // into the card its call created.
-        val callIndex = HashMap<String, Pair<Int, Int>>()
+        var usage: TokenUsage? = null
+        var model: String? = null
 
         fun indexCalls(messageIndex: Int) {
             val msg = out.getOrNull(messageIndex) ?: return
@@ -115,6 +213,10 @@ object SessionParser {
             blocks[blockIndex] = block
             out[messageIndex] = msg.copy(blocks = blocks)
         }
+
+        // Index everything already rendered first: this batch may carry the
+        // result of a call committed in an earlier one.
+        for (index in out.indices) indexCalls(index)
 
         for (event in events) {
             val type = event.optString("type")
@@ -152,6 +254,12 @@ object SessionParser {
                             blocks = listOf(Block.Notice("已达到最大输出长度", isError = false)),
                             time = time,
                         )
+                        "aborted" -> out += Message(
+                            id = "ab-$seq",
+                            role = Role.SYSTEM,
+                            blocks = listOf(Block.Notice("已停止生成", isError = false)),
+                            time = time,
+                        )
                         else -> Unit
                     }
                 }
@@ -176,6 +284,8 @@ object SessionParser {
                 "assistant/message" -> {
                     if (!isAppend(surfaceOp)) continue
                     val message = data.optJSONObject("message") ?: continue
+                    TokenUsage.fromUsage(data.optJSONObject("usage"))?.let { usage = it }
+                    modelLabelOf(message)?.let { model = it }
                     val blocks = blocksOf(message.optJSONArray("content"))
                     if (blocks.isEmpty()) continue
                     val id = message.optString("id").ifBlank { "a-$seq" }
@@ -215,9 +325,10 @@ object SessionParser {
                 "tool/result" -> {
                     if (!isAppend(surfaceOp)) continue
                     val message = data.optJSONObject("message")
-                    val callId = message?.optString("toolCallId")
-                        ?: message?.optJSONObject("source")?.optString("callId")
-                        ?: ""
+                    // `toolCallId` is the canonical field; older logs only carry
+                    // `source.callId`.
+                    val callId = message?.optString("toolCallId")?.takeIf { it.isNotBlank() }
+                        ?: message?.optJSONObject("source")?.optString("callId").orEmpty()
                     val output = textOf(message?.optJSONArray("content"))
                     val failed = message?.optBoolean("isError", false) == true || data.has("error")
 
@@ -230,11 +341,12 @@ object SessionParser {
                         }
                     } else if (output.isNotBlank()) {
                         out += Message(
-                            id = message?.optString("id")?.ifBlank { null } ?: "tr-$seq",
+                            id = message?.optString("id")?.takeIf { it.isNotBlank() } ?: "tr-$seq",
                             role = Role.TOOL,
                             blocks = listOf(Block.ToolCall(callId, "tool", "", output, failed)),
                             time = time,
                         )
+                        indexCalls(out.lastIndex)
                     }
                 }
 
@@ -269,11 +381,32 @@ object SessionParser {
             }
         }
 
-        return Folded(out, title, openTurn != null, lastSeq, openTurn)
+        return Folded(out, title, openTurn != null, lastSeq, openTurn, usage, model)
     }
 
     /** Only `"append"` surface operations are conversation. */
     private fun isAppend(surfaceOp: Any?): Boolean = surfaceOp is String && surfaceOp == "append"
+
+    /** `provider/model` from an assistant message's `source`, for the model chip. */
+    private fun modelLabelOf(message: JSONObject): String? {
+        val source = message.optJSONObject("source") ?: return null
+        val provider = source.optString("provider")
+        val model = source.optString("model")
+        if (provider.isBlank() || model.isBlank()) return null
+        return "$provider/$model"
+    }
+
+    /**
+     * The text of a `user/message` event, used to reconcile a local echo.
+     *
+     * A `user/message` carries its content at `data.content` rather than under
+     * `data.message`, unlike every other message-bearing event.
+     */
+    fun userTextOf(event: JSONObject): String? {
+        if (event.optString("type") != "user/message") return null
+        val data = event.optJSONObject("data") ?: return null
+        return textOf(data.optJSONArray("content"))
+    }
 
     // ---------------------------------------------------------------- blocks
 
@@ -330,12 +463,18 @@ object SessionParser {
  * the durable log. Chunks are indexed, so blocks are built by index:
  * `text-delta` and `reasoning-delta` append, `block-end` replaces the whole
  * block, and `tool-call-delta` appends to a JSON argument string.
+ *
+ * Frames carry an `attemptId`; a frame belonging to a newer attempt resets the
+ * accumulator, because a retry re-streams the same indices and would otherwise
+ * append the second attempt's text to the first's.
  */
 class LiveAssistant {
 
     private var turn = -1
     private var step = -1
+    private var attemptId = ""
     private val blocks = sortedMapOf<Int, MutableBlock>()
+    private var usage: TokenUsage? = null
 
     private class MutableBlock(
         var kind: String = "text",
@@ -347,13 +486,28 @@ class LiveAssistant {
 
     val isActive: Boolean get() = blocks.isNotEmpty()
 
+    /** Usage reported by the newest `usage` chunk of the live attempt. */
+    val lastUsage: TokenUsage? get() = usage
+
     /** @return true when this frame changed the draft. */
     fun apply(frame: JSONObject): Boolean {
+        // A frame from a different attempt (a retry) starts a clean slate.
+        val frameAttempt = frame.optString("attemptId")
+        if (frameAttempt.isNotBlank() && frameAttempt != attemptId) {
+            attemptId = frameAttempt
+            blocks.clear()
+            usage = null
+        }
+
         when (frame.optString("type")) {
             "start" -> {
                 turn = frame.optInt("turn", -1)
                 step = frame.optInt("step", -1)
                 blocks.clear()
+                // A new attempt starts from zero. Without this, a retry that has
+                // not yet reported its own `usage` would keep displaying the
+                // previous attempt's figure on top of the running total.
+                usage = null
                 return false
             }
             "chunk" -> {
@@ -381,6 +535,13 @@ class LiveAssistant {
                         b.kind = block.optString("type").ifBlank { b.kind }
                         b.text = block.optString("text").ifBlank { b.text }
                     }
+                    "usage" -> {
+                        // Provider accounting for the live attempt. It is not
+                        // renderable content, but it is the earliest signal the
+                        // UI can show, so it is kept and surfaced.
+                        TokenUsage.fromUsage(chunk.optJSONObject("usage"))?.let { usage = it }
+                        return true
+                    }
                     "finish" -> return true
                     else -> return false
                 }
@@ -402,6 +563,8 @@ class LiveAssistant {
         blocks.clear()
         turn = -1
         step = -1
+        attemptId = ""
+        usage = null
     }
 
     /** Build the provisional message, or null when there is nothing to show. */

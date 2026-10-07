@@ -1,5 +1,7 @@
 package ai.deepseek.dshmobile.ui
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -19,7 +21,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CloudDownload
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -51,6 +55,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
@@ -502,6 +507,56 @@ fun SettingsScreen(
                 }
             }
 
+            // -------------------------------------------------------- project
+            SectionCard("关于本项目") {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                Surface(
+                    onClick = { openUrl(context, PROJECT_URL) },
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            Icons.Default.Code,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("GitHub 项目地址", fontSize = 12.sp)
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                PROJECT_URL,
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                softWrap = false,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        Icon(
+                            Icons.AutoMirrored.Filled.OpenInNew,
+                            contentDescription = "在浏览器中打开",
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "源码、问题反馈与历史版本都在这里。应用内更新也默认从这个仓库的 Release 读取。",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    lineHeight = 16.sp,
+                )
+            }
+
             Text(
                 "DSH Mobile · 非官方客户端\nDeepSeek Harness 是 DeepSeek 的产品，本应用与其无隶属关系。",
                 fontSize = 11.sp,
@@ -511,6 +566,29 @@ fun SettingsScreen(
             )
         }
     }
+}
+
+/**
+ * The project's source repository.
+ *
+ * It is shown as a real, tappable link rather than plain text: this app is a
+ * non-official client of someone else's product, so "where did this come from,
+ * and what is in it" is the first thing a cautious user wants to check. A URL
+ * they would have to retype by hand does not answer that.
+ */
+private const val PROJECT_URL = "https://github.com/nmaych/dsh-mobile"
+
+/**
+ * Open [url] in whatever the user has for web pages.
+ *
+ * `FLAG_ACTIVITY_NEW_TASK` is required because the caller may not be an
+ * Activity context. `runCatching` guards the no-browser case: a device with no
+ * handler at all would otherwise crash on a settings tap.
+ */
+private fun openUrl(context: android.content.Context, url: String) {
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    runCatching { context.startActivity(intent) }
 }
 
 @Composable

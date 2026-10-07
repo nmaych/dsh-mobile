@@ -129,6 +129,13 @@ private fun DshRoot(
         onApiConfigChange = { base, key, model, sys -> vm.setApiConfig(base, key, model, sys) },
         onLoadModels = vm::loadModels,
         onSelectModel = vm::selectModel,
+        onLoadRemoteModels = vm::loadRemoteModels,
+        onSelectRemoteModel = { provider, model, effort ->
+            vm.selectRemoteModel(provider, model, effort)
+        },
+        onRefreshWorkspaces = vm::refreshWorkspaces,
+        onSelectWorkspace = vm::selectWorkspace,
+        onAddWorkspace = vm::addWorkspace,
         onUpdateManifestChange = vm::setUpdateManifestUrl,
         onCheckUpdate = {
             scope.launch {

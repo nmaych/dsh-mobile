@@ -52,14 +52,20 @@ class ChatApi {
 
     /** List model ids, used to populate the model picker. */
     suspend fun listModels(baseUrl: String, apiKey: String): List<String> = withContext(Dispatchers.IO) {
+        val url = endpoint(baseUrl, "models")
         val req = Request.Builder()
-            .url(endpoint(baseUrl, "models"))
+            .url(url)
             .header("Authorization", "Bearer $apiKey")
             .get()
             .build()
-        client.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code}: ${text.take(200)}")
+        val resp = try {
+            client.newCall(req).execute()
+        } catch (t: Throwable) {
+            throw RuntimeException(TransportErrors.message(url, t, TransportErrors.INTERNET_HINT))
+        }
+        resp.use { response ->
+            val text = response.body?.string().orEmpty()
+            if (!response.isSuccessful) throw RuntimeException("HTTP ${response.code}: ${text.take(200)}")
             val arr = JSONObject(text).optJSONArray("data") ?: JSONArray()
             (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.optString("id") }
                 .filter { it.isNotBlank() }
@@ -99,7 +105,9 @@ class ChatApi {
         val response: Response = try {
             call.execute()
         } catch (t: Throwable) {
-            trySend(StreamEvent.Failed(t.message ?: "无法连接"))
+            // The endpoint is an arbitrary internet host, so the LAN/plugin advice
+            // the remote path uses would be actively misleading here.
+            trySend(StreamEvent.Failed(TransportErrors.message(endpoint(baseUrl, "chat/completions"), t, TransportErrors.INTERNET_HINT)))
             close()
             return@callbackFlow
         }
@@ -141,7 +149,15 @@ class ChatApi {
             trySend(StreamEvent.Done)
         } catch (t: Throwable) {
             if (call.isCanceled()) trySend(StreamEvent.Done)
-            else trySend(StreamEvent.Failed(t.message ?: "流式读取中断"))
+            else trySend(
+                StreamEvent.Failed(
+                    TransportErrors.message(
+                        endpoint(baseUrl, "chat/completions"),
+                        t,
+                        TransportErrors.INTERNET_HINT,
+                    )
+                )
+            )
         } finally {
             runCatching { reader.close() }
             runCatching { response.close() }

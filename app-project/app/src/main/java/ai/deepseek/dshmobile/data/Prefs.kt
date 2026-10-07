@@ -88,6 +88,23 @@ class Prefs(context: Context) {
         get() = sp.getString(KEY_API_SYSTEM, "") ?: ""
         set(v) = sp.edit { putString(KEY_API_SYSTEM, v.trim()) }
 
+    // ---- remote session defaults -------------------------------------------
+
+    /**
+     * Workspace new sessions are created in.
+     *
+     * Empty means "let the desktop decide", which is the pre-1.1.2 behaviour and
+     * still the right default for someone who only ever uses one project.
+     */
+    var workspaceId: String
+        get() = sp.getString(KEY_WORKSPACE_ID, "") ?: ""
+        set(v) = sp.edit { putString(KEY_WORKSPACE_ID, v.trim()) }
+
+    /** Last reasoning effort the user picked, remembered across sessions. */
+    var reasoningEffort: String
+        get() = sp.getString(KEY_REASONING_EFFORT, "") ?: ""
+        set(v) = sp.edit { putString(KEY_REASONING_EFFORT, v.trim()) }
+
     // ---- update ------------------------------------------------------------
 
     var updateManifestUrl: String
@@ -113,6 +130,8 @@ class Prefs(context: Context) {
         const val KEY_API_KEY = "api_key"
         const val KEY_API_MODEL = "api_model"
         const val KEY_API_SYSTEM = "api_system"
+        const val KEY_WORKSPACE_ID = "workspace_id"
+        const val KEY_REASONING_EFFORT = "reasoning_effort"
         const val KEY_UPDATE_URL = "update_manifest_url"
         const val KEY_LAST_UPDATE = "last_update_check"
         const val KEY_SKIPPED_VERSION = "skipped_version"

@@ -35,10 +35,19 @@
 - 打开任意会话，**实时**看到助手的流式输出
 - 发送新消息、停止生成
 - 新建会话、重命名会话
+- **选择工作区**：新建的会话创建在你选中的工作区里，也可以直接填一个目录路径
+  把它注册成工作区
+- **更换模型**：按服务商挑选模型，支持推理强度的模型还能单独选强度
+- **查看 token 消耗**：当前会话的累计用量，以及上下文窗口占用了多少
 
 界面呈现与桌面端一致：用户气泡、助手回复、可折叠的「思考过程」、
 可展开的工具调用卡片（含参数与输出）、以及 Markdown 正文
 （代码块、标题、列表、引用、行内强调）。
+
+> 模型与工作区都取自桌面端已有的接口（`session/modelCatalog`、
+> `session/selectModel`、`workspace/*`），不需要额外装什么。
+> token 用量来自桌面端的 `session/projections`；桌面端没有装
+> token-meter 时这一项会自动隐藏，而不是显示成 0。
 
 ### 独立 API 对话
 
@@ -219,7 +228,7 @@ dsh-mobile/
 │       ├── data/
 │       │   ├── Prefs.kt             设置持久化
 │       │   ├── DshClient.kt         DSH 远程协议客户端
-│       │   └── SessionParser.kt     会话事件 → 消息模型
+│       │   └── SessionParser.kt     会话事件 → 消息模型（含 token 用量）
 │       ├── net/
 │       │   ├── ChatApi.kt           OpenAI 兼容接口客户端
 │       │   └── GatewayClient.kt     dsh-mobile-connect 网关客户端（配对、发现）
@@ -227,8 +236,8 @@ dsh-mobile/
 │       │   ├── ChatViewModel.kt     状态与业务逻辑
 │       │   ├── ChatScreen.kt        聊天界面
 │       │   ├── SettingsScreen.kt    设置界面
-│       │   ├── AppShell.kt          抽屉 + 页面切换
-│       │   ├── components/          Markdown、消息气泡
+│       │   ├── AppShell.kt          抽屉 + 页面切换 + 选择器对话框
+│       │   ├── components/          Markdown、消息气泡、模型/工作区/用量组件
 │       │   └── theme/               配色与排版
 │       └── update/
 │           └── UpdateManager.kt     检查 / 下载 / 校验 / 安装
@@ -258,7 +267,23 @@ DSH 的远程协议没有版本协商。升级桌面端后如果接口有变动�
 
 ## 测试
 
-`test/` 下有两个针对**真实服务端**的端到端脚本：
+`test/` 下有几个**离线**脚本，CI 每次提交都会跑，不需要 Android SDK：
+
+```sh
+node test/release-logic.test.mjs      # 版本号算术与 CHANGELOG 解析
+node test/gateway-contract.test.mjs   # 与 dsh-mobile-connect 的端点契约
+node test/feature-contract.test.mjs   # 工作区 / 模型 / token 的 wire 名
+node test/session-fold.test.mjs       # 会话事件 → 对话记录的折叠规则
+node test/regression-1.1.3.test.mjs   # 连接报错文案 / 子会话地址 / 芯片行布局
+```
+
+它们守的是「编译器看不见」的那类错误：改了一个端点名、写错一个参数键、
+或者把某个状态的作用域放错，Kotlin 都能编过，但用户手机上就是功能不生效。
+1.1.0 的配对失败和 1.1.2 的对话空白都属于这一类。1.1.3 的三个问题
+（连接失败显示 OkHttp 英文原文、子会话打不开、顶部芯片行被挤成竖排）
+同样是编译器拦不住的。
+
+另外有两个针对**真实服务端**的端到端脚本：
 
 ```sh
 # 握手、会话列表、创建、订阅、发消息、停止
