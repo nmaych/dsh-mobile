@@ -1227,6 +1227,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                         )
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Rethrown, not reported. `catch (t: Throwable)` would swallow the
+                // cancellation raised when the view model is cleared and turn it
+                // into a banner — a "failure" the user never caused and cannot fix.
+                // The sibling jobs (`refreshUsage`, `refreshWorkspaces`) already
+                // rethrow for exactly this reason.
+                throw e
             } catch (t: Throwable) {
                 _state.value = _state.value.copy(
                     switchingModel = false,

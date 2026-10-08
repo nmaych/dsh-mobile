@@ -215,6 +215,8 @@ fun ModelPickerDialog(
     onDismiss: () -> Unit,
     onLoad: () -> Unit,
     onPick: (provider: String, model: String, effort: String?) -> Unit,
+    /** Why the last catalog load failed, shown instead of the empty-state advice. */
+    error: String? = null,
 ) {
     var pendingEffortFor by remember { mutableStateOf<ModelRow?>(null) }
 
@@ -275,10 +277,22 @@ fun ModelPickerDialog(
                     }
 
                     models.isEmpty() -> Column(Modifier.padding(8.dp)) {
+                        // A failed load and an empty account are different
+                        // problems with different fixes, and the old copy asserted
+                        // the second one unconditionally. When the catalog request
+                        // timed out, the dialog told the user to go log in on the
+                        // desktop — sending them to fix an account that was fine,
+                        // while the real reason sat in the error banner *behind*
+                        // this dialog. Reporting the failure here is what makes
+                        // "选择模型时提示连接超时" actionable.
                         Text(
-                            "没有可用的模型。请确认桌面端已登录账号或配置了 API Key。",
+                            error ?: "没有可用的模型。请确认桌面端已登录账号或配置了 API Key。",
                             fontSize = 12.sp,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (error != null) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
                             lineHeight = 17.sp,
                         )
                         Spacer(Modifier.height(10.dp))

@@ -168,6 +168,12 @@ Cookie: <会话Cookie>
 provider 列举模型时抛错的原因。切换用 `session/selectModel`，回答
 `{"selected": {"provider","model","reasoningEffort"?}}`。
 
+> **这是最慢的一个一元调用。** 它会向**每个**已配置的 provider 要模型列表，
+> 其中可能有需要联网刷新的远程目录，所以慢到几十秒是正常的，不代表桌面端卡死。
+> 客户端据此给了它 120 秒的读超时（只为兜住无限等待），并且**不**把这种超时
+> 报成「连接超时」——socket 这时其实是连上的，地址和 Wi-Fi 都没问题。
+> 见 `net/TransportErrors.kt` 里三种超时的区分。
+
 ### token 用量
 
 `session/projections` 一次返回所有已注册投影：
@@ -239,6 +245,36 @@ Cookie: <会话Cookie>
 
 同理，`tool/result` 往往在 `tool/call` 之后的另一批事件里到达，所以
 `callId → 卡片位置` 的索引也必须跨批次保留，只在切换会话时清空。
+
+### 超时与重试（1.1.4 起）
+
+两种传输各有各的超时，**不能共用一个客户端**：
+
+| 路径 | 读超时 | 理由 |
+| --- | --- | --- |
+| mux WebSocket（`http`） | `0`（无限） | 流是长连接，读超时会在正常空闲时把它掐断 |
+| 一元 RPC / 握手（`rpcHttp`） | 120 秒 | 只为兜住**无限等待**，不是用来催正常请求 |
+
+一元调用此前用的是**同一个**无限读超时的客户端，后果是双重的：桌面端卡住时
+选模型会一直转圈（既不出结果也不报错），而唯一还能报出来的超时只剩**连接**超时。
+两个客户端由 `http.newBuilder()` 派生，因此**共享连接池与 CookieJar**。
+
+同一个 `SocketTimeoutException` 其实对应三种不同的失败，必须分开报，否则会把
+用户送去修一个没坏的东西：
+
+| 异常里的文字 | 真实含义 | 该说的话 |
+| --- | --- | --- |
+| `…didn't receive pong within…` | mux 心跳超时（OkHttp 的 `pingInterval`），流会自行重连 | 连接中断，正在自动重连 |
+| `connect timed out` | TCP 没连上（只由 `IoBridge.connect` 产生） | 连接超时，去查 Wi-Fi / 桌面端 |
+| `timeout` / `Read timed out` | socket 已连上，桌面端没及时回 | 已连上，桌面端可能正忙，稍后重试 |
+
+判定用异常自带的文字而不是类型，因为三者是同一个类型。
+
+**只有连接超时会被重试，且只重试一次。** 请求根本没到桌面端，所以重复发送不会
+重复执行（`session/prompt` 不会被跑两次）——这也是 OkHttp 自身 `isRecoverable`
+的条件（`SocketTimeoutException && !requestSendStarted`）。读超时**不重试**：
+那时桌面端可能已经在处理了。OkHttp 自己不会替我们重试，因为它只考虑**换一条路由**
+（`RouteSelector`），而手机只有一个 Wi-Fi、地址是字面 IP，路由只有一条。
 
 ### `session/follow` 的 args
 
@@ -392,6 +428,62 @@ session/agent-busy: subagent Sessions require their durable parent address
 
 思考内容没有独立事件类型，它是 `assistant/message` 里 `type:"reasoning"` 的块。
 
+### 一轮 = 多条 `assistant/message`（1.1.4 起用于合并显示）
+
+**一次对话（turn）会产生很多条 `assistant/message`，不是一条。** 每条对应一个
+*step*，而一步就是一次模型调用，所以「读三个文件再跑一条命令」这样一轮会写下五到六条
+结算。实测 41 份会话日志：一轮平均 **29 条**，最多的一轮 **830 条**。
+
+把 `data.turn` 用来分组即可还原成一条回答。这个字段**在实测数据里 100% 存在**：
+
+| 事件 | `data.turn` 存在 / 总数 |
+|---|---|
+| `assistant/message` | 4126 / 4126 |
+| `tool/call` | 5056 / 5056 |
+| `tool/result` | 5093 / 5093 |
+
+`data.step` 同样存在，但**分组要用 `turn` 而不是 `step`**：`step` 是每一轮内部
+重新计数的，跨轮不可比。
+
+三条规则是客户端自己定的，服务端没有对应约定：
+
+1. **`turn` 缺失的行是分界**。`llm/retry`、`approval/asked`、`turn/end` 都不带
+   `turn`，所以「跨过提示去合并」在结构上不可能发生，而不是靠一条要记得遵守的规则。
+   实测 313 轮里，201 轮被 `approval/asked` 正确截断、7 轮被 `llm/retry` 截断。
+2. **`tool/result` 找不到对应 assistant 消息时会自建一张卡**，这张卡也带 `turn`，
+   因此会并入所属的那一轮，而不会把一轮从中间切成两半。
+3. **只合并显示**。折叠器内部的列表必须保持日志原样，因为
+   `callId → (messageIndex, blockIndex)` 索引寻址的是那份列表。
+
+对 35 份真实日志的验证（`mergeTurns` 前后）：
+
+| 检查 | 结果 |
+|---|---|
+| 行数 4439 → 549 | 折叠掉 87.6% |
+| 重复的消息 id | 0 |
+| 丢失的工具卡 | 0 |
+| 丢失的工具输出 | 0 |
+| 每组首个 id 发生变化 | 0 |
+
+### 工具调用的参数形状（1.1.4 起用于生成标签）
+
+`tool/call.data.name` 的取值来自 41 份日志里的 **5041 条**真实调用，分布是
+`pwsh` 2228、`read` 917、`edit` 640、`write` 407、`grep` 306、`read_image` 126、
+`web_fetch` 89、`job_output` 77、`todo_write` 43，其余 17 种都在 40 条以下
+（含 `pash` 这个 `pwsh` 的拼写变体，也要处理）。
+
+`data.arguments` 是 **JSON 字符串**，且**有两种形状**：
+
+```json
+{"command": "Get-ChildItem", "description": "List files"}          // 通常
+{"arguments": {"url": "https://…"}, "name": "web_fetch"}            // 10 条这样
+```
+
+第二种是模型把参数多套了一层，**必须解包**，否则那次调用会显示成没有目标。
+按工具取哪个参数是有讲究的：文件类取 `file_path`、命令类取 `command`、
+搜索类取 `pattern`。若按「第一个字符串参数」去扫，`pwsh` 会显示成
+`{"description": "List files"}` 而把真正的命令藏起来。
+
 ### 如何判断「还在生成」
 
 以 `turn/start` / `turn/end` 配对为准：看到 `turn/start{turn:n}` 且没有对应的
@@ -476,6 +568,9 @@ node test/modeltest.mjs "http://127.0.0.1:19555/?token=…"
   要么给合法值。
 - **子会话（`origin == "subagent"`）不能按普通会话寻址**，见 4.5 节；
   读写走不同端点，且 `subagents` 的两个方法形状并不一致。
+- **一轮对话有很多条 `assistant/message`**（平均 29 条，最多 830 条），
+  靠 `data.turn` 分组才能还原成一条回答；`data.step` 每轮重新计数，不能用来分组。
+- **`tool/call.data.arguments` 有两种嵌套形状**，多套一层的那种必须解包。
 - **`subagents/interruptByParent` 的三个参数是顶层的**，没有 `request` 包装
   ——它和 `subagents/prompt` 不一样。
 - **`address.mode` 传 `"unknown"` 时服务端跳过 mode 比对**，所以投影没读到也能读

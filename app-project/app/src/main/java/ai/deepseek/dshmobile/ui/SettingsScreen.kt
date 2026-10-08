@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -78,6 +79,15 @@ fun SettingsScreen(
     onPairWithCode: (String, String) -> Unit,
     onDiscover: () -> Unit,
     onPickServer: (String) -> Unit,
+    /**
+     * Pair from a scanned `dshmobile://pair?…` link.
+     *
+     * Separate from [onPair], which takes the `dsh web` URL and needs a `?token=`.
+     * The two are different paths — one goes through the plugin's gateway, the
+     * other straight at the Harness — and a scanned pairing QR belongs to the
+     * first. Routing a scanned link into [onPair] would fail on the missing token.
+     */
+    onPairLink: (String) -> Unit,
     onUnpair: () -> Unit,
     onReconnect: () -> Unit,
     onApiConfigChange: (String, String, String, String) -> Unit,
@@ -95,6 +105,11 @@ fun SettingsScreen(
     var apiModel by remember { mutableStateOf(state.selectedModel) }
     var apiSystem by remember { mutableStateOf(apiSystemPrompt) }
     var manifest by remember { mutableStateOf(updateManifestUrl) }
+
+    // Hoisted above the backend branches: `rememberLauncherForActivityResult`
+    // registers with the Activity's result registry, and doing that inside a
+    // conditional composable makes the registration come and go with the branch.
+    val scanQr = rememberQrScanner { onPairLink(it) }
 
     Scaffold(
         topBar = {
@@ -188,6 +203,55 @@ fun SettingsScreen(
                             lineHeight = 17.sp,
                         )
                         Spacer(Modifier.height(10.dp))
+
+                        // --- scan it ----------------------------------------
+                        // First and widest, because it is the only one of the
+                        // three ways in that needs nothing typed: the desktop is
+                        // already showing a QR with the address *and* the code.
+                        Button(
+                            onClick = scanQr,
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !state.connecting,
+                        ) {
+                            Icon(
+                                Icons.Default.QrCodeScanner,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("扫描二维码连接", fontSize = 13.sp)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "对着电脑上 dsh-mobile-connect 显示的二维码扫一下，地址和配对码都会自动填好。",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 16.sp,
+                        )
+
+                        Spacer(Modifier.height(12.dp))
+
+                        // A failure has to be shown *here*, not only on the chat
+                        // screen. Settings is a separate screen from the one that
+                        // renders `state.error`, so a scan that failed — the wrong
+                        // QR, a bad code, an unreachable desktop — dropped the user
+                        // back on this card with no explanation at all, which reads
+                        // as "the button does nothing".
+                        //
+                        // Only the error is shown, not `state.info`: that field also
+                        // carries unrelated notices ("已添加工作区…"), and a pairing
+                        // card is the wrong place to report them. Success needs no
+                        // line here either — a successful pair flips this card to
+                        // the connected state below.
+                        state.error?.let { message ->
+                            Text(
+                                message,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.error,
+                                lineHeight = 17.sp,
+                            )
+                            Spacer(Modifier.height(10.dp))
+                        }
 
                         // --- find it for me ---------------------------------
                         Row(verticalAlignment = Alignment.CenterVertically) {

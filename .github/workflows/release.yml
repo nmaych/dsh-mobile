@@ -116,7 +116,12 @@ jobs:
           DSH_KEYSTORE_PASSWORD: ${{ secrets.DSH_KEYSTORE_PASSWORD }}
           DSH_KEY_ALIAS: ${{ secrets.DSH_KEY_ALIAS }}
           DSH_KEY_PASSWORD: ${{ secrets.DSH_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        # `chmod +x` guards the same lost-mode failure ci.yml documents: without
+        # it a missing executable bit fails a *release* run with a bare
+        # "Permission denied", after the tag has already been pushed.
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
 
       # ---------------------------------------------------------------------
       # Verify before publishing.

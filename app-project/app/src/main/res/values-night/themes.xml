@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        The dark counterpart of `values/themes.xml`, selected by the system
+        dark-mode setting — the same signal `DshTheme` uses, so the launch frame and
+        the Compose UI can no longer disagree about which theme is in effect.
+    -->
+    <style name="Theme.DshMobile" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">#FF0B1220</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+    </style>
+</resources>

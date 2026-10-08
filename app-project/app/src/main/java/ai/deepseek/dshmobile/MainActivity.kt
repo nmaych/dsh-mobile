@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -43,12 +44,26 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Draw behind the system bars and let the app bar fill the status bar
+        // strip. Before this the window kept the default insets, and the strip the
+        // system bar sits in was painted by the platform — from a hardcoded dark
+        // `statusBarColor`, so a light-mode phone showed a near-black band above a
+        // white app bar (the 1.1.4 "屏幕上方有黑边" report). `enableEdgeToEdge`
+        // also derives the bar icon appearance from the theme, so the icons stay
+        // legible when the user switches light/dark.
+        enableEdgeToEdge()
         pendingPairLink = pairLinkFrom(intent)
         setContent {
             DshTheme {
                 DshRoot(
                     pendingPairLink = pendingPairLink,
                     onPairLinkConsumed = { pendingPairLink = null },
+                    // A scanned QR is routed through the *same* `pendingPairLink`
+                    // slot a deep link uses, so there is exactly one path from "we
+                    // have a pairing link" to "we are connected". Scanning in-app
+                    // and scanning with the system camera therefore cannot drift:
+                    // both end in `ChatViewModel.pairFromLink`.
+                    onPairLink = { pendingPairLink = it },
                 )
             }
         }
@@ -74,6 +89,7 @@ class MainActivity : ComponentActivity() {
 private fun DshRoot(
     pendingPairLink: String? = null,
     onPairLinkConsumed: () -> Unit = {},
+    onPairLink: (String) -> Unit = {},
 ) {
     val vm: ChatViewModel = viewModel()
     val state by vm.state.collectAsState()
@@ -124,6 +140,7 @@ private fun DshRoot(
         onPairWithCode = vm::pairWithCode,
         onDiscover = vm::discoverGateways,
         onPickServer = vm::setServerAddress,
+        onPairLink = onPairLink,
         onUnpair = vm::unpair,
         onReconnect = vm::reconnect,
         onApiConfigChange = { base, key, model, sys -> vm.setApiConfig(base, key, model, sys) },

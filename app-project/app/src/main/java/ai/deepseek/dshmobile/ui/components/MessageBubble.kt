@@ -16,7 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
@@ -36,11 +36,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Block
 import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.Role
+import ai.deepseek.dshmobile.data.ToolLabel
 
 @Composable
 fun MessageBubble(message: Message, modifier: Modifier = Modifier) {
@@ -115,7 +117,7 @@ private fun AssistantBubble(message: Message, modifier: Modifier) {
             for (block in message.blocks) {
                 when (block) {
                     is Block.Text -> Markdown(block.text)
-                    is Block.Reasoning -> ReasoningBlock(block.text)
+                    is Block.Reasoning -> ReasoningBlock(block)
                     is Block.ToolCall -> ToolCallBlock(block)
                     is Block.Notice -> Text(
                         block.text,
@@ -173,9 +175,17 @@ private fun SystemBubble(message: Message, modifier: Modifier) {
     }
 }
 
-/** Collapsible "thinking" section. */
+/**
+ * Collapsible "thinking" section.
+ *
+ * [Block.Reasoning.parts] counts how many separate reasoning blocks were folded
+ * into this one by the turn merge. Saying so matters: a turn that thought twenty
+ * times used to render as twenty collapsed boxes, and one box with no indication
+ * of its size reads as a single short thought. The count is the honest label, and
+ * it is what makes the merged form easier to trust than the split one.
+ */
 @Composable
-private fun ReasoningBlock(text: String) {
+private fun ReasoningBlock(block: Block.Reasoning) {
     var expanded by remember { mutableStateOf(false) }
     Column(
         Modifier
@@ -195,7 +205,7 @@ private fun ReasoningBlock(text: String) {
             )
             Spacer(Modifier.width(5.dp))
             Text(
-                "思考过程",
+                if (block.parts > 1) "思考过程 · ${block.parts} 段" else "思考过程",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -210,7 +220,7 @@ private fun ReasoningBlock(text: String) {
         }
         AnimatedVisibility(visible = expanded) {
             Text(
-                text,
+                block.text,
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -220,10 +230,29 @@ private fun ReasoningBlock(text: String) {
     }
 }
 
-/** Collapsible tool invocation. */
+/**
+ * One step of a turn: what the assistant did, in words.
+ *
+ * The header used to be the tool's identifier — `pwsh`, `read`, `edit` — in
+ * monospace. That named the mechanism and hid the act: a user could see that
+ * something happened but not that a command ran or which file was read. The
+ * header is now the verb and its target ("运行命令 Get-ChildItem …", "读取
+ * ui/ChatScreen.kt"), with the identifier kept as a small trailing tag so the
+ * detail is still there for anyone who wants it.
+ *
+ * A step that has not reported back yet is marked as running. That distinction
+ * was previously invisible, and it is the one thing a user watching a long turn
+ * actually wants to know.
+ */
 @Composable
 private fun ToolCallBlock(block: Block.ToolCall) {
     var expanded by remember { mutableStateOf(false) }
+    val running = block.output == null && !block.failed
+    val accent = when {
+        block.failed -> MaterialTheme.colorScheme.error
+        running -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.primary
+    }
     Column(
         Modifier
             .fillMaxWidth()
@@ -235,19 +264,25 @@ private fun ToolCallBlock(block: Block.ToolCall) {
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                Icons.Default.Build,
+                when {
+                    block.failed -> Icons.Default.ErrorOutline
+                    running -> Icons.Default.Autorenew
+                    else -> Icons.Default.Check
+                },
                 contentDescription = null,
                 modifier = Modifier.size(13.dp),
-                tint = if (block.failed) MaterialTheme.colorScheme.error
-                else MaterialTheme.colorScheme.primary,
+                tint = accent,
             )
             Spacer(Modifier.width(5.dp))
             Text(
-                block.name,
+                // Falls back to the raw name when the arguments cannot be read, so
+                // an unknown tool still says *something* rather than "工具".
+                ToolLabel.describe(block.name, block.input).ifBlank { block.name },
                 fontSize = 12.sp,
-                fontFamily = FontFamily.Monospace,
                 fontWeight = FontWeight.Medium,
                 color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
             Icon(
@@ -259,7 +294,14 @@ private fun ToolCallBlock(block: Block.ToolCall) {
         }
         AnimatedVisibility(visible = expanded) {
             Column(Modifier.padding(top = 5.dp)) {
+                Text(
+                    block.name,
+                    fontSize = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 if (block.input.isNotBlank() && block.input != "{}") {
+                    Spacer(Modifier.height(4.dp))
                     Text(
                         block.input.take(1200),
                         fontSize = 11.sp,

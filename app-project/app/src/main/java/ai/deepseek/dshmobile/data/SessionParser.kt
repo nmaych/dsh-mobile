@@ -9,7 +9,17 @@ enum class Role { USER, ASSISTANT, SYSTEM, TOOL }
 /** One rendered block inside a message. */
 sealed interface Block {
     data class Text(val text: String) : Block
-    data class Reasoning(val text: String) : Block
+
+    /**
+     * A stretch of the model's reasoning.
+     *
+     * [parts] is how many separate reasoning blocks were folded into this one by
+     * [SessionParser.mergeTurns]; it is 1 for a block straight out of the log. The
+     * count is carried so the UI can say a thinking section was merged rather than
+     * pretending the model thought once.
+     */
+    data class Reasoning(val text: String, val parts: Int = 1) : Block
+
     data class ToolCall(
         val callId: String,
         val name: String,
@@ -27,6 +37,16 @@ data class Message(
     val blocks: List<Block> = emptyList(),
     val streaming: Boolean = false,
     val time: Long = 0L,
+    /**
+     * The turn this entry belongs to, when the log says so.
+     *
+     * A single turn is many steps: one `assistant/message` per step, each with its
+     * own reasoning and tool call. The turn number is what lets the transcript
+     * group those steps back into the one response the user asked for — see
+     * [SessionParser.mergeTurns]. Null for anything the server does not tag with a
+     * turn, which is every user and system row.
+     */
+    val turn: Int? = null,
 ) {
     val plainText: String
         get() = blocks.filterIsInstance<Block.Text>().joinToString("\n") { it.text }
@@ -289,9 +309,19 @@ object SessionParser {
                     val blocks = blocksOf(message.optJSONArray("content"))
                     if (blocks.isEmpty()) continue
                     val id = message.optString("id").ifBlank { "a-$seq" }
+                    // The turn is what lets one response be reassembled from the
+                    // many steps that produced it; every real settlement carries
+                    // it (4126/4126 in the sampled logs).
+                    val turn = data.optInt("turn", -1).takeIf { it >= 0 }
                     // Replace an earlier render of the same message id.
                     val existing = out.indexOfFirst { it.id == id }
-                    val entry = Message(id = id, role = Role.ASSISTANT, blocks = blocks, time = time)
+                    val entry = Message(
+                        id = id,
+                        role = Role.ASSISTANT,
+                        blocks = blocks,
+                        time = time,
+                        turn = turn,
+                    )
                     if (existing >= 0) out[existing] = entry else out += entry
                     indexCalls(if (existing >= 0) existing else out.lastIndex)
                 }
@@ -305,8 +335,15 @@ object SessionParser {
                     if (callId.isNotBlank() && !callIndex.containsKey(callId)) {
                         val name = data.optString("name").ifBlank { "tool" }
                         val args = data.optString("arguments")
+                        val turn = data.optInt("turn", -1).takeIf { it >= 0 }
                         val last = out.lastOrNull()
-                        if (last != null && last.role == Role.ASSISTANT) {
+                        // Attaching to the previous assistant entry is what keeps
+                        // the call with the step that made it. The turn must agree:
+                        // hanging a new turn's call on the previous turn's message
+                        // would move it into a group it does not belong to.
+                        if (last != null && last.role == Role.ASSISTANT &&
+                            (turn == null || last.turn == turn)
+                        ) {
                             val blocks = last.blocks + Block.ToolCall(callId, name, args)
                             out[out.lastIndex] = last.copy(blocks = blocks)
                             indexCalls(out.lastIndex)
@@ -316,6 +353,9 @@ object SessionParser {
                                 role = Role.TOOL,
                                 blocks = listOf(Block.ToolCall(callId, name, args)),
                                 time = time,
+                                // Carried so the card joins the turn it belongs to
+                                // instead of splitting that turn in two.
+                                turn = turn,
                             )
                             indexCalls(out.lastIndex)
                         }
@@ -345,6 +385,7 @@ object SessionParser {
                             role = Role.TOOL,
                             blocks = listOf(Block.ToolCall(callId, "tool", "", output, failed)),
                             time = time,
+                            turn = data.optInt("turn", -1).takeIf { it >= 0 },
                         )
                         indexCalls(out.lastIndex)
                     }
@@ -386,6 +427,160 @@ object SessionParser {
 
     /** Only `"append"` surface operations are conversation. */
     private fun isAppend(surfaceOp: Any?): Boolean = surfaceOp is String && surfaceOp == "append"
+
+    // ------------------------------------------------------------ turn merging
+
+    /**
+     * Fold one turn's many steps into one assistant entry.
+     *
+     * A turn is one answer, but the log writes one `assistant/message` per *step*,
+     * and a step is one model call. A turn that reads three files and runs a
+     * command is therefore five or six settlements — measured over 35 real sessions
+     * the average is 29 steps per turn and the largest single turn had 830. Rendered
+     * literally that is a column of near-identical bubbles, each with its own
+     * "思考过程" box, which is what the 1.1.4 report described: the same answer
+     * apparently repeating itself.
+     *
+     * Two things are merged and one is deliberately not:
+     *
+     *  - **Reasoning becomes one block**, carrying how many parts it folded. The
+     *    user asked to see the thinking of a turn as one thing; splitting it per
+     *    step also hid it, since every part was collapsed by default.
+     *  - **Tool calls stay in order and stay separate.** They are the steps, and
+     *    collapsing them would hide exactly the "读取 / 编辑 / 运行命令" sequence
+     *    this release is meant to surface. A call re-stated by a later step keeps
+     *    the copy that has a result, so a tool never renders twice.
+     *  - **Text blocks are NOT concatenated.** Intermediate narration ("let me look
+     *    at X") and the final answer are different things; gluing them into one
+     *    paragraph would bury the answer inside the play-by-play.
+     *
+     * Only messages that share a **non-null turn** merge, and a row without one
+     * ends the group. That is what keeps a notice between two steps (`llm/retry`,
+     * `approval/asked`, `turn/end`) visible instead of silently swallowed: those
+     * carry no turn, so they are a boundary by construction rather than by a rule
+     * someone has to remember to apply. A turn the server never labelled is left
+     * alone rather than guessed at.
+     *
+     * A `TOOL` row *is* part of its turn — it is how a `tool/result` whose call was
+     * never seen in an assistant message still gets a card — so it joins the group
+     * and contributes its tool block instead of splitting the turn in two.
+     *
+     * The result is display-only: [fold]'s own list stays as the log wrote it,
+     * because `callIndex` addresses blocks by their position in it.
+     */
+    fun mergeTurns(messages: List<Message>): List<Message> {
+        if (messages.size < 2) return messages
+        val out = mutableListOf<Message>()
+        var i = 0
+        while (i < messages.size) {
+            val first = messages[i]
+            val turn = first.turn
+            // A group starts at either an assistant settlement or a standalone tool
+            // card, because both are part of the turn they name. Starting only at an
+            // assistant row would leave an orphan `tool/result` that happens to
+            // precede its turn's first settlement stranded outside the group.
+            val startsTurn = first.role == Role.ASSISTANT || first.role == Role.TOOL
+            if (turn == null || !startsTurn) {
+                out += first
+                i++
+                continue
+            }
+            var end = i + 1
+            while (end < messages.size && messages[end].turn == turn) end++
+            out += if (end - i == 1) first else mergeSteps(messages.subList(i, end))
+            i = end
+        }
+        return out
+    }
+
+    /** The single entry that replaces one turn's [group] of step settlements. */
+    private fun mergeSteps(group: List<Message>): Message {
+        val thinking = StringBuilder()
+        var parts = 0
+        // Where the merged reasoning block goes: the position of the turn's first
+        // one, so the entry still reads "thought, then acted".
+        var thinkingAt = -1
+        val blocks = mutableListOf<Block>()
+        // `callId -> index in blocks`, so a call restated by a later step updates
+        // its existing card instead of adding a second one.
+        val seen = mutableMapOf<String, Int>()
+
+        for (message in group) {
+            for (block in message.blocks) {
+                when (block) {
+                    is Block.Reasoning -> {
+                        if (thinkingAt < 0) {
+                            blocks += Block.Reasoning("")
+                            thinkingAt = blocks.lastIndex
+                        }
+                        if (block.text.isNotBlank()) {
+                            if (thinking.isNotEmpty()) thinking.append("\n\n")
+                            thinking.append(block.text.trim())
+                        }
+                        // `parts` is carried rather than recounted, so merging an
+                        // already-merged group stays correct.
+                        parts += block.parts
+                    }
+
+                    is Block.ToolCall -> {
+                        val at = if (block.callId.isBlank()) null else seen[block.callId]
+                        if (at == null) {
+                            blocks += block
+                            if (block.callId.isNotBlank()) seen[block.callId] = blocks.lastIndex
+                        } else {
+                            // Keep whichever copy knows the outcome; a later step
+                            // that merely repeats the call must not erase a result
+                            // that has already landed.
+                            val previous = blocks[at] as Block.ToolCall
+                            if (previous.output == null && block.output != null) blocks[at] = block
+                        }
+                    }
+
+                    else -> blocks += block
+                }
+            }
+        }
+
+        if (thinkingAt >= 0) blocks[thinkingAt] = Block.Reasoning(thinking.toString(), parts)
+
+        // The merged entry keeps the first settlement's id, because that is the id
+        // the transcript has already rendered and the list keys on. `Role` becomes
+        // ASSISTANT: the group is one assistant turn, and a lone `TOOL` row folded
+        // in must not decide how the whole turn is drawn.
+        return group.first().copy(
+            role = Role.ASSISTANT,
+            blocks = blocks,
+            streaming = group.any { it.streaming },
+        )
+    }
+
+    /**
+     * Attach the in-flight streaming draft to an already-merged transcript.
+     *
+     * Split out from [mergeTurns] because the two run at completely different
+     * rates. The durable transcript changes once per event batch; the draft changes
+     * on every token delta, tens of times a second. Re-merging the whole transcript
+     * for each delta would rebuild every finished turn's reasoning text over and
+     * over — on a long session that is megabytes of string churn per second — so
+     * [mergeTurns] is remembered against the durable list alone and only the turn
+     * the draft belongs to is rebuilt here.
+     *
+     * A draft whose turn matches the last entry's is merged into it, which is what
+     * stops a live reply from appearing as a second bubble beside the steps of the
+     * turn it is still producing.
+     */
+    fun withDraft(merged: List<Message>, draft: Message?): List<Message> {
+        if (draft == null) return merged
+        val last = merged.lastOrNull() ?: return merged + draft
+        // A `TOOL` row counts too: an orphan result carries its turn, and the turn
+        // it belongs to may not have settled its next step yet. `mergeSteps`
+        // normalises the result to an assistant entry, so the turn is still drawn
+        // as a response rather than as a tool card with a reply bolted on.
+        val partOfTurn = last.role == Role.ASSISTANT || last.role == Role.TOOL
+        val joins = partOfTurn && last.turn != null && last.turn == draft.turn
+        if (!joins) return merged + draft
+        return merged.dropLast(1) + mergeSteps(listOf(last, draft))
+    }
 
     /** `provider/model` from an assistant message's `source`, for the model chip. */
     private fun modelLabelOf(message: JSONObject): String? {
@@ -583,6 +778,15 @@ class LiveAssistant {
             }
         }
         if (out.isEmpty()) return null
-        return Message(id = "live", role = Role.ASSISTANT, blocks = out, streaming = true)
+        return Message(
+            id = "live",
+            role = Role.ASSISTANT,
+            blocks = out,
+            streaming = true,
+            // The live draft carries its turn too, so it merges with the steps of
+            // the same turn that have already settled. Without it the draft would
+            // render as a second bubble beside the turn it belongs to.
+            turn = turn.takeIf { it >= 0 },
+        )
     }
 }

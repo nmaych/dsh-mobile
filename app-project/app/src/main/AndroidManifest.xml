@@ -6,6 +6,23 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
+    <!--
+        Scanning the pairing QR the desktop shows.
+
+        Declared here as well as in the scanner library's own manifest, which
+        already merges them in, so the permission is visible to anyone reading
+        this file and cannot vanish if that dependency is ever swapped.
+
+        `required="false"` is load-bearing, not decoration: a phone without a
+        camera must still be able to install the app and pair by typing the code,
+        and `required="true"` would have the store filter it off every such
+        device.
+    -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
     <application
         android:name=".DshApp"
         android:allowBackup="true"

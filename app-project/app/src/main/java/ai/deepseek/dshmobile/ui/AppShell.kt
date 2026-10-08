@@ -70,6 +70,7 @@ fun AppShell(
     onPairWithCode: (String, String) -> Unit,
     onDiscover: () -> Unit,
     onPickServer: (String) -> Unit,
+    onPairLink: (String) -> Unit,
     onUnpair: () -> Unit,
     onReconnect: () -> Unit,
     onApiConfigChange: (String, String, String, String) -> Unit,
@@ -106,6 +107,7 @@ fun AppShell(
             onPairWithCode = onPairWithCode,
             onDiscover = onDiscover,
             onPickServer = onPickServer,
+            onPairLink = onPairLink,
             onUnpair = onUnpair,
             onReconnect = onReconnect,
             onApiConfigChange = onApiConfigChange,
@@ -133,6 +135,7 @@ fun AppShell(
             currentModel = state.activeModel,
             currentEffort = state.activeEffort,
             loading = state.loadingModels,
+            error = state.error,
             onDismiss = { showModelPicker = false },
             onLoad = onLoadRemoteModels,
             onPick = { provider, model, effort ->

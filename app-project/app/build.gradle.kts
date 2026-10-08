@@ -14,11 +14,11 @@ plugins {
 // drifted before, and the symptom is an update prompt that never goes away.
 //
 // Keep these in step with the newest CHANGELOG entry: the scheme is
-// major*10000 + minor*100 + patch, so 1.1.3 is 10103. See docs/RELEASING.md.
+// major*10000 + minor*100 + patch, so 1.1.4 is 10104. See docs/RELEASING.md.
 // ---------------------------------------------------------------------------
-val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10103").toIntOrNull()
+val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10104").toIntOrNull()
     ?: error("DSH_VERSION_CODE must be an integer")
-val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.1.3"
+val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.1.4"
 
 // ---------------------------------------------------------------------------
 // Release signing.
@@ -153,6 +153,16 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+    // Scanning the desktop's pairing QR. Two artifacts, not the ~12 that a
+    // CameraX + zxing-core build needs, because this library ships its own
+    // capture Activity. It needs neither appcompat nor a support library: its
+    // `CaptureActivity` extends the framework `android.app.Activity`, and its
+    // theme derives from a framework theme, so it does not care that this app
+    // uses `android:Theme.Material.NoActionBar`. `ScanContract` is already an
+    // `ActivityResultContract`, and the capture Activity requests the CAMERA
+    // permission itself.
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

@@ -121,6 +121,31 @@ class DshClient(private val prefs: Prefs) {
         .retryOnConnectionFailure(true)
         .build()
 
+    /**
+     * The same transport, but with a read timeout, for the unary calls.
+     *
+     * `readTimeout(0)` above is correct for the mux socket and wrong for
+     * everything else. It is an *infinite* read timeout, so a unary RPC whose
+     * response never arrives waits forever: the model picker spins, the "切换"
+     * button stays disabled, and nothing is ever reported. That is also why the
+     * only timeout this app could ever show on the RPC path was a *connect*
+     * timeout, which is what made "选择模型时提示连接超时" so confusing — the one
+     * failure it could name was the one that had not happened.
+     *
+     * `session/modelCatalog` is the call this matters for. It enumerates every
+     * provider's models, so it is the slowest unary call the app makes and the
+     * one most likely to outlive a user's patience. Bounding it means a wedged
+     * desktop is reported as "桌面端没有及时返回结果" — a sentence the user can
+     * act on by retrying — instead of a spinner that never resolves.
+     *
+     * The connection pool is deliberately *shared* with `http`: both clients
+     * talk to the same authority with the same cookie jar, and a separate pool
+     * would double the sockets to the desktop.
+     */
+    private val rpcHttp: OkHttpClient = http.newBuilder()
+        .readTimeout(RPC_READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+        .build()
+
     // ------------------------------------------------------------------ errors
 
     class DshException(message: String, val code: String = "error") : Exception(message)
@@ -191,11 +216,16 @@ class DshClient(private val prefs: Prefs) {
     suspend fun pair(origin: String, token: String): String = withContext(Dispatchers.IO) {
         val base = origin.trim().trimEnd('/')
         val url = "$base/?token=${java.net.URLEncoder.encode(token, "UTF-8")}"
-        val resp = try {
-            http.newCall(Request.Builder().url(url).get().build()).execute()
-        } catch (t: java.io.IOException) {
-            throw transportError(base, t, code = "handshake")
-        }
+        // The handshake is unary too, so it goes through the same bounded,
+        // retrying sender as every other one-shot call: `http`'s infinite read
+        // timeout would leave a stalled desktop spinning on the pairing screen
+        // forever, and a radio that has not woken up yet would fail the pairing
+        // that would have worked a moment later.
+        val resp = executeUnary(
+            Request.Builder().url(url).get().build(),
+            base,
+            code = "handshake",
+        )
         resp.use { response ->
             if (response.code !in 200..399) {
                 throw DshException("握手失败：HTTP ${response.code}", "handshake")
@@ -249,11 +279,7 @@ class DshClient(private val prefs: Prefs) {
 
         // A dead network must not surface as raw OkHttp text: the user cannot
         // act on "port 39694 ... after 20000ms".
-        val resp = try {
-            http.newCall(req).execute()
-        } catch (t: java.io.IOException) {
-            throw transportError(base, t)
-        }
+        val resp = executeUnary(req, base)
         resp.use { response ->
             val text = response.body?.string().orEmpty()
             when (response.code) {
@@ -264,6 +290,62 @@ class DshClient(private val prefs: Prefs) {
                 throw DshException("HTTP ${response.code}: ${text.take(300)}", "http-${response.code}")
             }
             parseResponse(text, rpcId)
+        }
+    }
+
+    /**
+     * Send one unary request, retrying a connect failure once.
+     *
+     * This is the actual fix for "新建对话选择模型时提示连接超时".
+     *
+     * The trigger is a *transient* failure to open a TCP connection: the phone's
+     * Wi-Fi radio is dozing, the desktop's gateway is mid-restart, or the ARP
+     * entry for it has gone stale. All three are over within a second or two and
+     * all three look identical from here — a connect that expired. Reporting the
+     * first one as a hard failure is what made picking a model feel broken, and
+     * it is why the message named a timeout the user could not reproduce.
+     *
+     * OkHttp will not retry this itself, even with
+     * `retryOnConnectionFailure(true)`. A connect timeout *is* classified as
+     * recoverable (`isRecoverable` accepts `SocketTimeoutException` when the
+     * request was never sent), but recovery still has to find somewhere else to
+     * send it: `retryAfterFailure()` asks the `RouteSelector` for another route,
+     * and a phone with one Wi-Fi and a literal IP has exactly one. With nothing
+     * left to try the failure propagates on the first attempt, so the app has to
+     * do the retrying.
+     *
+     * Only a connect timeout is retried, and only once:
+     *
+     *  - A connect timeout is safe by construction. The request never reached the
+     *    desktop, so repeating it cannot double-apply anything. This is exactly
+     *    the condition OkHttp's own `isRecoverable` checks
+     *    (`SocketTimeoutException && !requestSendStarted`), and it is why a
+     *    *read* timeout is deliberately excluded below: there the desktop may
+     *    already be acting on the request, and `session/prompt` would run twice.
+     *  - One retry, with a short pause, is enough to ride out a radio wake-up.
+     *    Retrying harder would only delay the error the user eventually needs.
+     */
+    private suspend fun executeUnary(
+        req: Request,
+        base: String,
+        code: String = "transport",
+    ): Response {
+        var attempt = 0
+        while (true) {
+            try {
+                return rpcHttp.newCall(req).execute()
+            } catch (t: java.io.IOException) {
+                val retryable = attempt < UNARY_CONNECT_RETRIES &&
+                    TransportErrors.isConnectTimeout(t)
+                if (!retryable) throw transportError(base, t, code)
+                attempt++
+                Log.w(TAG, "connect timed out; retrying once (attempt $attempt)")
+                // `delay`, not `Thread.sleep`: this runs inside `withContext`, and a
+                // blocking sleep would hold the IO thread and ignore cancellation —
+                // so a user who backed out during the pause would still be waiting
+                // for it to finish.
+                delay(UNARY_RETRY_DELAY_MS)
+            }
         }
     }
 
@@ -1095,6 +1177,31 @@ class DshClient(private val prefs: Prefs) {
 
         /** Linear backoff step; the phone is normally back within a few seconds. */
         private const val RETRY_BASE_MS = 900L
+
+        /**
+         * How long a unary call waits for the desktop to answer.
+         *
+         * Generous on purpose. The slowest legitimate call is
+         * `session/modelCatalog`, which asks every configured provider for its
+         * model list, and one of those providers can be a remote catalog refresh
+         * that takes tens of seconds. Too short and a working setup reports a
+         * failure; the point of the bound is only to stop an *infinite* wait, so
+         * it is set well past any honest response time rather than near it.
+         */
+        private const val RPC_READ_TIMEOUT_SECONDS = 120L
+
+        /**
+         * Extra attempts for a unary call whose TCP connect expired.
+         *
+         * One. The failure this rides out is a radio that has not woken up yet,
+         * which resolves in well under a second; anything longer is a desktop that
+         * is genuinely unreachable, and the user needs to be told rather than kept
+         * waiting.
+         */
+        private const val UNARY_CONNECT_RETRIES = 1
+
+        /** Pause before the retry, long enough for a dozing radio to come back. */
+        private const val UNARY_RETRY_DELAY_MS = 400L
 
         private fun baseNameOf(path: String): String =
             path.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { path }

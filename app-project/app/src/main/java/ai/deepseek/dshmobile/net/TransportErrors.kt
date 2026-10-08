@@ -1,5 +1,6 @@
 package ai.deepseek.dshmobile.net
 
+import java.io.InterruptedIOException
 import java.net.ConnectException
 import java.net.NoRouteToHostException
 import java.net.SocketException
@@ -83,8 +84,27 @@ object TransportErrors {
             chain.any { it is UnknownHostException } ->
                 "找不到主机 $where。请检查地址是否填写正确。$hint"
 
-            chain.any { it is SocketTimeoutException } ->
-                "连接 $where 超时。$hint"
+            // Three different failures arrive as a timeout, and the advice is
+            // different for each — see the helpers below. Collapsing them into one
+            // "连接…超时" told a user whose desktop was merely slow that their Wi-Fi
+            // was broken, and told a user whose socket had stalled to go check a
+            // network the app was already reconnecting by itself.
+            //
+            // The test is the *parent* type on purpose. `SocketTimeoutException`
+            // extends `InterruptedIOException`, and okio's own read timeout arrives
+            // as a plain `InterruptedIOException("timeout")` — which used to fall
+            // through to the catch-all "无法连接", the one arm that is definitely
+            // wrong, because that socket did connect. Testing the subclass alone
+            // would leave that case misreported.
+            chain.any { it is InterruptedIOException } -> when {
+                isHeartbeatStall(chain) ->
+                    "与 $where 的连接中断了（心跳超时），正在自动重连。$hint"
+
+                isConnectTimeout(t) -> "连接 $where 超时。$hint"
+
+                else ->
+                    "已连上 $where，但桌面端没有及时返回结果。它可能正忙，请稍后重试。$hint"
+            }
 
             chain.any { it is NoRouteToHostException } ->
                 "到 $where 没有可用路由。$hint"
@@ -103,6 +123,49 @@ object TransportErrors {
                 "无法连接 $where。$hint"
         }
     }
+
+    /**
+     * True when a WebSocket's own ping/pong keep-alive expired.
+     *
+     * This is the "新建对话选择模型时提示连接超时" report, and the wording it
+     * used to produce was actively misleading. `DshClient` sets
+     * `pingInterval(20s)`, and OkHttp fails a WebSocket with a bare
+     * `SocketTimeoutException("sent ping but didn't receive pong within …")`
+     * when a pong does not come back in time. That message contains no
+     * "connect" and no "read": it is the *only* signal that separates a stalled
+     * socket from a host that cannot be reached, and the app used to render all
+     * three as the same sentence.
+     *
+     * It fires in exactly the reported situation. Selecting a model on a fresh
+     * conversation creates the session, which opens the `session/follow` mux
+     * stream, and the mux is the one long-lived socket on the phone. When the
+     * phone's Wi-Fi power-saves — the screen is on but the radio naps — the
+     * pong is late, the socket is declared dead, and the *model* call that was
+     * riding it reports a timeout. The fix for the user is not "check your
+     * Wi-Fi": the stream retries by itself, and saying "连接超时" hid that.
+     */
+    private fun isHeartbeatStall(chain: List<Throwable>): Boolean =
+        chain.any { it is SocketTimeoutException && it.message?.contains("pong") == true }
+
+    /**
+     * True when the TCP connect itself expired, which is the one timeout that
+     * really is a network problem.
+     *
+     * `Socket.connect(endpoint, timeout)` reports this as
+     * `SocketTimeoutException("connect timed out")`, so the word `connect` is what
+     * separates "we never reached the desktop" from "we reached it and it was
+     * slow". Only this case justifies sending the user to check their Wi-Fi.
+     *
+     * Public because [ai.deepseek.dshmobile.data.DshClient] also uses it to decide
+     * whether a request may be retried, and the two must agree: the app may only
+     * repeat a request it has proven never reached the desktop. Deriving that
+     * answer twice is how a retry eventually double-applies a prompt.
+     */
+    fun isConnectTimeout(t: Throwable): Boolean =
+        causeChain(t).any {
+            it is SocketTimeoutException &&
+                it.message?.contains("connect", ignoreCase = true) == true
+        }
 
     /** The throwable and its causes, outermost first, bounded against a cycle. */
     private fun causeChain(t: Throwable): List<Throwable> {

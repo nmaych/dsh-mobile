@@ -2,6 +2,7 @@ package ai.deepseek.dshmobile.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,17 +12,21 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,6 +36,7 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -49,21 +55,80 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
+import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.ui.components.MessageBubble
 import ai.deepseek.dshmobile.ui.components.ModelChip
 import ai.deepseek.dshmobile.ui.components.UsageChip
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+
+/**
+ * How close to the end still counts as "at the bottom".
+ *
+ * A list scrolled to the end rarely reports an exact match — the last item's
+ * bottom sits within a pixel or two of the viewport edge — so an exact test would
+ * treat a pinned list as unpinned and stop following the stream.
+ */
+private val BOTTOM_SLACK = 24.dp
+
+/**
+ * The offset passed to the scroll-to-item calls so they land on the **end** of the
+ * content rather than the start of the last item.
+ *
+ * This matters because of the turn merge. `scrollToItem(lastIndex)` puts the last
+ * item's *top* at the top of the viewport, which is only the same thing as "the
+ * newest text is visible" while the last item is shorter than the screen. A merged
+ * turn is one item that can be far taller than the screen — the largest turn in the
+ * sampled logs had 830 steps — so aligning its top would scroll to the *beginning*
+ * of the turn and push the text that just streamed in off the bottom of the screen,
+ * which is the opposite of following the stream.
+ *
+ * Passing a large offset instead scrolls past the item's start, and the lazy list
+ * clamps to the end of its content, so the newest line always ends up in view. The
+ * value is bounded rather than `Int.MAX_VALUE` because the offset is added to a
+ * pixel position internally, and an offset that large risks overflowing that
+ * arithmetic into a negative position. A million pixels is ~3000dp, comfortably
+ * taller than any transcript entry, and overflowing it would only mean landing a
+ * little above the bottom rather than at it.
+ */
+private const val PIN_TO_END_PX = 1_000_000
+
+/**
+ * Bring the newest content into view, without fighting the user.
+ *
+ * `animateScrollToItem` is only used when a whole new message arrives, because a
+ * scroll animation takes long enough to be cancelled mid-drag; a growing message is
+ * snapped instead. Any failure is swallowed: the list can be momentarily
+ * inconsistent while it is being remeasured, and a failed scroll is not worth taking
+ * the screen down for.
+ */
+private suspend fun scrollToNewest(state: LazyListState, index: Int, animate: Boolean) {
+    runCatching {
+        if (animate) {
+            state.animateScrollToItem(index, scrollOffset = PIN_TO_END_PX)
+        } else {
+            state.scrollToItem(index, scrollOffset = PIN_TO_END_PX)
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,17 +146,107 @@ fun ChatScreen(
 ) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    val bottomSlackPx = with(LocalDensity.current) { BOTTOM_SLACK.roundToPx() }
 
-    // The transcript is the durable log plus the provisional streaming draft.
-    val rendered = remember(state.messages, state.liveDraft) {
-        if (state.liveDraft != null) state.messages + state.liveDraft else state.messages
+    // The transcript is the durable log with each turn's steps reassembled into the
+    // one response it was, plus the in-flight draft joined onto its own turn.
+    //
+    // The durable merge is remembered against `state.messages` alone, so a token
+    // delta only rebuilds the turn being streamed — see `SessionParser.withDraft`.
+    val merged = remember(state.messages) { SessionParser.mergeTurns(state.messages) }
+    val rendered = remember(merged, state.liveDraft) {
+        SessionParser.withDraft(merged, state.liveDraft)
     }
 
-    // Keep the newest message in view as tokens stream in.
-    LaunchedEffect(rendered.size, rendered.lastOrNull()?.blocks?.size) {
-        if (rendered.isNotEmpty()) {
-            runCatching { listState.animateScrollToItem(rendered.lastIndex) }
+    // Geometry: is the bottom of the transcript on screen *right now*? This drives
+    // the "最新" button, which is a statement about the current view.
+    val pinnedToBottom by remember(bottomSlackPx) {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            if (info.totalItemsCount == 0) return@derivedStateOf true
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
+            last.index >= info.totalItemsCount - 1 &&
+                last.offset + last.size <= info.viewportEndOffset + bottomSlackPx
         }
+    }
+
+    // Intent: should the view chase the newest content?
+    //
+    // This is deliberately a separate flag from `pinnedToBottom`, and the
+    // distinction is the fix. Gating auto-scroll on the geometry alone cannot work,
+    // because streaming *grows* the last item: the moment a block is appended the
+    // content extends past the viewport, the geometry reports "not at the bottom",
+    // and auto-follow switches itself off part-way through the turn — the exact
+    // opposite of following it. The old code had the same blind spot from the other
+    // side: it never checked at all, and re-scrolled on every delta.
+    //
+    // So the flag is written **only** by the user's own gestures, never by geometry
+    // and never by our own scrolling:
+    //
+    //  - A drag start takes control immediately. That is what ends the fight the
+    //    instant a finger lands, and it is the actual fix for "下滑时有概率无法
+    //    下滑": the old code re-issued a scroll animation on every token delta, and
+    //    an in-flight animation cancels the drag underneath it.
+    //  - When the drag ends, following resumes only if the list *settles* at the
+    //    bottom. Waiting for the settle rather than reading at drag-end is what makes
+    //    a fling towards the bottom work: at the moment the finger lifts the list is
+    //    still short of the end.
+    //
+    // Nothing here reacts to a programmatic scroll, which matters more than it
+    // looks. `isScrollInProgress` is also set by `animateScrollToItem`, so a settle
+    // handler that fired for every scroll would let auto-scroll switch *itself* off:
+    // if the reply grew while the animation ran, the animation would finish short of
+    // the new end, the settle would read "not at the bottom", and following would
+    // stop until the user dragged again. Reacting only to drag interactions makes
+    // that impossible — once following is on, it stays on until a finger says
+    // otherwise.
+    var followNewest by remember { mutableStateOf(true) }
+    LaunchedEffect(listState, bottomSlackPx) {
+        // The pending "wait for the fling to finish" job. It is a plain local, not
+        // Compose state: it never needs to trigger recomposition, only to be
+        // cancelled when a new drag supersedes it.
+        //
+        // Cancelling matters. The wait must not run *inside* the collector: that
+        // would suspend the loop, so a drag beginning during the wait would sit in
+        // the flow's buffer and only be seen once the settle had already written
+        // `followNewest = pinnedToBottom` — re-enabling auto-scroll underneath a
+        // finger that is actively dragging. Launching it separately keeps the
+        // collector free to react to the next gesture immediately.
+        var settleJob: Job? = null
+        listState.interactionSource.interactions.collect { interaction ->
+            when (interaction) {
+                is DragInteraction.Start -> {
+                    settleJob?.cancel()
+                    followNewest = false
+                }
+                is DragInteraction.Stop, is DragInteraction.Cancel -> {
+                    settleJob?.cancel()
+                    settleJob = launch {
+                        // Let any fling run out before deciding where the user landed.
+                        snapshotFlow { listState.isScrollInProgress }.first { !it }
+                        followNewest = pinnedToBottom
+                    }
+                }
+                else -> Unit
+            }
+        }
+    }
+    // A different session starts pinned to its own newest message, rather than
+    // inheriting "scrolled up" from the conversation the user just left.
+    LaunchedEffect(state.activeSessionId) { followNewest = true }
+
+    // Keep the newest message in view as tokens stream in.
+    //
+    // A new message gets a short animation; a growing one is snapped, because
+    // animating every delta is both wasteful and long enough to swallow a drag.
+    var lastCount by remember { mutableIntStateOf(0) }
+    LaunchedEffect(rendered.size, rendered.lastOrNull()?.blocks?.size) {
+        if (rendered.isEmpty()) return@LaunchedEffect
+        val isNewMessage = rendered.size != lastCount
+        lastCount = rendered.size
+        if (!followNewest) return@LaunchedEffect
+        scrollToNewest(listState, rendered.lastIndex, animate = isNewMessage)
     }
 
     Scaffold(
@@ -190,6 +345,22 @@ fun ChatScreen(
                             MessageBubble(msg)
                         }
                     }
+                }
+
+                // Once the user scrolls up, following the stream is suspended — so
+                // there has to be a way back that is not "scroll all the way down
+                // by hand". It appears only when it is needed.
+                if (!pinnedToBottom && rendered.isNotEmpty()) {
+                    JumpToLatest(
+                        onClick = {
+                            scope.launch {
+                                scrollToNewest(listState, rendered.lastIndex, animate = true)
+                            }
+                        },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 12.dp, bottom = 12.dp),
+                    )
                 }
 
                 state.error?.let { error ->
@@ -295,6 +466,43 @@ private fun RemoteChipsRow(
     }
 }
 
+/**
+ * The "back to the newest message" affordance.
+ *
+ * It exists because auto-scroll now yields to the user: once the stream stops
+ * following, the only way back would otherwise be to drag through however many
+ * screens of history have accumulated. It is a filled surface rather than a bare
+ * icon so it stays visible over the transcript's varied backgrounds.
+ */
+@Composable
+private fun JumpToLatest(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        onClick = onClick,
+        modifier = modifier,
+        shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.primary,
+        shadowElevation = 4.dp,
+    ) {
+        Row(
+            Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = MaterialTheme.colorScheme.onPrimary,
+            )
+            Spacer(Modifier.width(3.dp))
+            Text(
+                "最新",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onPrimary,
+            )
+        }
+    }
+}
+
 @Composable
 private fun LoadingState() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -387,8 +595,11 @@ private fun InputBar(
         Row(
             Modifier
                 .fillMaxWidth()
-                .imePadding()
-                .navigationBarsPadding()
+                // The keyboard and the navigation bar overlap, so their insets are
+                // unioned rather than added. Applying `imePadding()` and
+                // `navigationBarsPadding()` in sequence stacks them, leaving a
+                // bar-height gap between the input and an open keyboard.
+                .windowInsetsPadding(WindowInsets.ime.union(WindowInsets.navigationBars))
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {

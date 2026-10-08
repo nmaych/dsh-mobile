@@ -1,9 +1,34 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        The window frame. Three things matter here and all three were wrong before
+        1.1.4, together producing the "屏幕上方有黑边" report.
+
+        1. The system bar colours are TRANSPARENT, not a hardcoded dark navy. They
+           used to be `#FF0B1220` in a theme whose Compose colours follow the system
+           light/dark setting. On a phone in light mode that painted a near-black
+           band above a white app bar. The app now draws edge to edge (see
+           `MainActivity.onCreate`), so the app bar itself fills that strip and
+           there is nothing left to mismatch.
+
+        2. `windowBackground` is the LIGHT background, and `values-night/` carries
+           the dark one. This is the colour of the frame drawn before the first
+           Compose frame, so a hardcoded dark value meant a dark flash on a light
+           phone even after the status bar itself was fixed.
+
+        3. `windowLightStatusBar` is true here, because the background above is
+           light and dark icons are the readable choice. `values-night/` flips it.
+           `enableEdgeToEdge()` re-derives the same answer at runtime, so the frame
+           and the running app cannot disagree.
+
+        `windowLightNavigationBar` is deliberately absent: it needs API 27 while
+        minSdk is 26, and `enableEdgeToEdge()` sets the navigation bar appearance at
+        runtime anyway, so the attribute would only be a second source of truth.
+    -->
     <style name="Theme.DshMobile" parent="android:Theme.Material.NoActionBar">
-        <item name="android:statusBarColor">#FF0B1220</item>
-        <item name="android:navigationBarColor">#FF0B1220</item>
-        <item name="android:windowBackground">#FF0B1220</item>
-        <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">#FFF7F8FC</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
     </style>
 </resources>

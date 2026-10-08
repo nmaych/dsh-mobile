@@ -69,6 +69,20 @@ jobs:
       - name: Test 1.1.3 regressions
         run: node test/regression-1.1.3.test.mjs
 
+      # Guards the 1.1.4 fixes, which are the same kind of invisible: a hardcoded
+      # status-bar colour that only shows on a light-mode phone, an auto-scroll that
+      # cancels the user's drag, a `turn` field that was present in every event and
+      # never used, and tool cards headed by a tool's identifier instead of its act.
+      - name: Test 1.1.4 regressions
+        run: node test/regression-1.1.4.test.mjs
+
+      # Guards repository invariants the build depends on but nothing local can
+      # see — chiefly the Gradle wrapper's executable bit, whose absence failed
+      # this very job with "./gradlew: Permission denied" (exit 126) while every
+      # Windows checkout looked perfectly fine.
+      - name: Test repository hygiene
+        run: node test/repo-hygiene.test.mjs
+
   build:
     name: Assemble debug
     runs-on: ubuntu-latest
@@ -96,9 +110,19 @@ jobs:
 
       # The wrapper lives in app-project/, not the repository root, because that
       # is where the Gradle build is. See docs/RELEASING.md.
+      #
+      # `chmod +x` is not redundant with the mode stored in git. The executable
+      # bit is easy to lose without noticing — a Windows contributor re-adding
+      # the file, a squash that drops modes, an upload through the web UI — and
+      # on Windows it is invisible either way (core.filemode=false). Losing it
+      # fails this step with `./gradlew: Permission denied` and exit 126, which
+      # names neither the file's mode nor the fix. Restoring it here costs
+      # nothing and makes the build independent of the mode surviving.
       - name: Assemble debug
         working-directory: app-project
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
