@@ -125,7 +125,7 @@ jobs:
           ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: dsh-mobile-debug
           path: app-project/app/build/outputs/apk/debug/*.apk
