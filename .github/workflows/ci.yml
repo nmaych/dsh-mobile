@@ -76,6 +76,16 @@ jobs:
       - name: Test 1.1.4 regressions
         run: node test/regression-1.1.4.test.mjs
 
+      # Guards the 1.1.5 fixes, which are invisible to the compiler in the same
+      # way: two optional wire fields that are valid individually but refused
+      # together (`session/create`), an XML orientation attribute that lives in a
+      # dependency's manifest and so cannot be edited from here, release notes that
+      # are Markdown but were drawn as one flat paragraph, and an update-download
+      # button that did not exist — leaving `UpdateManager.download` with no caller
+      # in the UI at all.
+      - name: Test 1.1.5 regressions
+        run: node test/regression-1.1.5.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

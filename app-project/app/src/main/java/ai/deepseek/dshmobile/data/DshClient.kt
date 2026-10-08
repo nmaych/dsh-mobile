@@ -755,6 +755,19 @@ class DshClient(private val prefs: Prefs) {
      * The descriptor accepts `workspaceId`, `cwd`, `sessionId` and
      * `agentPreset`; only the first two are useful here, and sending an unknown
      * key is rejected outright, so each is added only when it has a value.
+     *
+     * **`workspaceId` and `cwd` are mutually exclusive.** The server rejects a
+     * request carrying both with `gateway/bad-request`:
+     *
+     *     session.create accepts workspaceId or cwd, not both
+     *
+     * The two are not alternatives that happen to conflict — a workspace *is* a
+     * directory, and the server resolves `cwd = workspace.path` itself. So when a
+     * workspace is named, `cwd` is not merely redundant, it is refused. The
+     * workspace therefore wins and `cwd` is sent only when there is no workspace
+     * to name; that keeps "create in this project" and "create in this directory"
+     * as one call instead of two, and means a caller may pass both without
+     * having to know which one the server prefers.
      */
     suspend fun createSession(
         origin: String,
@@ -763,7 +776,7 @@ class DshClient(private val prefs: Prefs) {
     ): String {
         val req = JSONObject()
         if (!workspaceId.isNullOrBlank()) req.put("workspaceId", workspaceId)
-        if (!cwd.isNullOrBlank()) req.put("cwd", cwd)
+        if (workspaceId.isNullOrBlank() && !cwd.isNullOrBlank()) req.put("cwd", cwd)
         val value = rpc(origin, "session", "create", JSONObject().put("request", req))
         return value.optString("sessionId").ifBlank {
             throw DshException("创建会话失败：服务器未返回 sessionId", "create-failed")

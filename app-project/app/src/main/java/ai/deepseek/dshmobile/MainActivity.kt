@@ -19,9 +19,11 @@ import ai.deepseek.dshmobile.ui.AppShell
 import ai.deepseek.dshmobile.ui.ChatViewModel
 import ai.deepseek.dshmobile.ui.UpdateStateHolder
 import ai.deepseek.dshmobile.ui.theme.DshTheme
+import ai.deepseek.dshmobile.update.UpdateInfo
 import ai.deepseek.dshmobile.update.UpdateManager
 import ai.deepseek.dshmobile.update.UpdateState
 import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * The pairing link the desktop embeds in its QR code:
@@ -171,21 +173,50 @@ private fun DshRoot(
             }
         },
         onInstallUpdate = {
-            val current = updateHolder.value
-            when (current) {
+            // Hand a verified APK to the system installer.
+            //
+            // The permission is checked *here*, immediately before the hand-off,
+            // rather than when the download started: the user may have gone to the
+            // system screen and granted it in the meantime, in which case this
+            // installs straight away and no extra tap is needed. The state is only
+            // moved to `InstallPermissionRequired` on a genuine refusal, and that
+            // state carries the already-verified file, so a retry never downloads
+            // the APK a second time.
+            fun installVerified(file: File, info: UpdateInfo) {
+                if (!updater.canInstallPackages()) {
+                    updateHolder.value = UpdateState.InstallPermissionRequired(file, info)
+                    updater.requestInstallPermission()
+                    return
+                }
+                // A device with no package-installer activity at all throws here
+                // rather than returning, so a refusal has to be reported — the
+                // alternative is a button that looks dead.
+                if (!updater.install(file)) {
+                    updateHolder.value = UpdateState.Failed(
+                        "无法启动系统安装器，请手动打开已下载的安装包。"
+                    )
+                }
+            }
+
+            when (val current = updateHolder.value) {
+                // "下载并安装". This branch previously had no button at all, which
+                // left `UpdateManager.download` unreachable from the UI: checking
+                // for updates could report a new version but never fetch it.
                 is UpdateState.Available -> {
-                    if (!updater.canInstallPackages()) {
-                        updater.requestInstallPermission()
-                        updateHolder.value = UpdateState.Failed(
-                            "请先允许本应用安装未知来源应用，然后再次点击安装。"
-                        )
+                    val existing = updater.downloadedFile(current.info)
+                    if (existing != null) {
+                        // Verified on an earlier attempt (typically one that stopped
+                        // at the permission prompt); reuse it instead of spending
+                        // another 12 MB.
+                        installVerified(existing, current.info)
                     } else {
                         scope.launch {
                             updater.download(current.info).collect { updateHolder.value = it }
                         }
                     }
                 }
-                is UpdateState.ReadyToInstall -> updater.install(current.file)
+                is UpdateState.InstallPermissionRequired -> installVerified(current.file, current.info)
+                is UpdateState.ReadyToInstall -> installVerified(current.file, current.info)
                 else -> Unit
             }
         },

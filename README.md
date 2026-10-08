@@ -283,6 +283,7 @@ node test/feature-contract.test.mjs   # 工作区 / 模型 / token 的 wire 名
 node test/session-fold.test.mjs       # 会话事件 → 对话记录的折叠规则
 node test/regression-1.1.3.test.mjs   # 连接报错文案 / 子会话地址 / 芯片行布局
 node test/regression-1.1.4.test.mjs   # edge-to-edge 系统栏 / 自动滚动让位 / 回合合并 / 工具标签
+node test/regression-1.1.5.test.mjs   # 互斥 wire 字段 / 扫码竖屏 / 更新说明 Markdown / 应用内下载
 node test/repo-hygiene.test.mjs       # gradlew 可执行位、LF/shebang、workflow 调用位置
 ```
 
@@ -293,6 +294,13 @@ node test/repo-hygiene.test.mjs       # gradlew 可执行位、LF/shebang、work
 同样是编译器拦不住的。1.1.4 的四个问题也是——一个 XML 里的十六进制颜色、
 一个「每次增量都重新滚动」的修饰符行为、一个始终存在却没人用的 `turn` 字段、
 以及把工具标识符当成描述来显示。
+
+1.1.5 又是同一类，而且更隐蔽一点：`session/create` 的 `workspaceId` 和 `cwd`
+**各自都是合法的 wire 名**，描述符校验和 Kotlin 编译器都不会报错，
+只有服务端在运行时拒绝「两个都给」；扫描界面的方向写在**依赖模块自己的清单**里，
+本仓库改不动；更新说明一直是 Markdown，只是被当成纯文本画了出来；
+而应用内下载的问题是**少了一个按钮**——`UpdateManager.download` 根本没有调用方，
+这种「代码写了但没人用」的缺口没有任何编译器会提。
 
 `repo-hygiene` 守的是另一类：**只在别人机器上坏掉的东西**。`gradlew` 缺可执行位
 让 Linux CI 报 `./gradlew: Permission denied`（退出码 126），而 Windows 上

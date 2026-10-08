@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -60,7 +61,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
+import ai.deepseek.dshmobile.ui.components.Markdown
 import ai.deepseek.dshmobile.update.UpdateState
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -531,26 +534,56 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.primary,
                         )
                         if (u.info.notes.isNotBlank()) {
-                            Spacer(Modifier.height(4.dp))
-                            Text(
-                                u.info.notes,
-                                fontSize = 12.sp,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                lineHeight = 17.sp,
-                            )
+                            Spacer(Modifier.height(6.dp))
+                            UpdateNotes(u.info.notes, u.info.versionName)
                         }
+                        Spacer(Modifier.height(10.dp))
+                        // The download button belongs *here*, next to the notes
+                        // that describe what is being downloaded. It was missing
+                        // from this branch entirely before 1.1.5 — the only
+                        // install button lived in the ReadyToInstall branch, which
+                        // is reached *after* a download, so `UpdateManager.download`
+                        // was unreachable from the UI and "check for updates" could
+                        // only ever tell the user a version existed.
+                        Button(onClick = onInstallUpdate) {
+                            Icon(
+                                Icons.Default.CloudDownload,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text("下载并安装", fontSize = 13.sp)
+                        }
+                        Spacer(Modifier.height(5.dp))
+                        Text(
+                            "安装包会在下载完成后校验 SHA-256，校验不通过不会安装。",
+                            fontSize = 11.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 16.sp,
+                        )
                     }
                     is UpdateState.Downloading -> Column {
                         Text(
-                            "下载中 ${u.percent}%",
+                            if (u.total > 0) {
+                                "下载中 ${u.percent}%（${formatBytes(u.received)} / ${formatBytes(u.total)}）"
+                            } else {
+                                "下载中 ${formatBytes(u.received)}"
+                            },
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.height(6.dp))
-                        LinearProgressIndicator(
-                            progress = { u.percent / 100f },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
+                        if (u.total > 0) {
+                            LinearProgressIndicator(
+                                progress = { u.percent / 100f },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            // A server that sends no Content-Length cannot be
+                            // turned into a percentage. An indeterminate bar still
+                            // says "working", where a 0% bar says "stuck".
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
                     }
                     is UpdateState.ReadyToInstall -> Column {
                         Text(
@@ -563,10 +596,38 @@ fun SettingsScreen(
                             Text("立即安装", fontSize = 13.sp)
                         }
                     }
+                    is UpdateState.InstallPermissionRequired -> Column {
+                        Text(
+                            "已下载并校验通过：${u.info.versionName}",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        // Named as a step, not an error: the download succeeded and
+                        // the file is on disk, so this is a system toggle away from
+                        // installing. Phrasing it as a failure is what made users
+                        // re-download the same APK.
+                        Text(
+                            "还需要一步：允许本应用安装未知来源应用。",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            lineHeight = 17.sp,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = onInstallUpdate) {
+                                Text("去授权", fontSize = 13.sp)
+                            }
+                            OutlinedButton(onClick = onCheckUpdate) {
+                                Text("重新检查", fontSize = 13.sp)
+                            }
+                        }
+                    }
                     is UpdateState.Failed -> Text(
                         u.message,
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.error,
+                        lineHeight = 17.sp,
                     )
                 }
             }
@@ -629,6 +690,79 @@ fun SettingsScreen(
                 modifier = Modifier.padding(top = 4.dp, bottom = 20.dp),
             )
         }
+    }
+}
+
+/**
+ * The release notes, rendered as Markdown.
+ *
+ * `notes` comes from the CHANGELOG section for the version, so it is real
+ * Markdown — `###` headings, `-` bullets, `**bold**` and `` `code` ``. It used
+ * to go through a plain `Text`, which collapsed a structured entry into one
+ * undifferentiated block: the headings were indistinguishable from the prose and
+ * the bullets ran together. Reusing the transcript renderer means the update
+ * prompt and the chat read the same way, and one renderer is one thing to fix.
+ *
+ * The block is scrollable and height-capped rather than free-growing. A real
+ * entry for this project runs to several thousand characters (1.1.4's is ~9 KB),
+ * and letting that expand inline pushes the download button — the whole point of
+ * the card — off the bottom of the screen.
+ *
+ * `[version]`-style reference links, which the CHANGELOG keeps at the very end of
+ * the file, never appear here: `changelogSection` stops at the next `## [` heading.
+ */
+@Composable
+private fun UpdateNotes(notes: String, version: String) {
+    Column {
+        Text(
+            "更新内容",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(4.dp))
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(
+                Modifier
+                    .heightIn(max = 260.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(10.dp),
+            ) {
+                Markdown(notes, baseColor = MaterialTheme.colorScheme.onSurface)
+            }
+        }
+        Spacer(Modifier.height(3.dp))
+        Text(
+            "以上为 $version 的更新说明。",
+            fontSize = 10.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * Bytes as a short human-readable size.
+ *
+ * Progress is shown against the advertised `Content-Length`, so the number is
+ * the size of an APK — MB, not KB — but the unit is derived rather than assumed
+ * so a small test manifest does not read as "0.0 MB".
+ */
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val units = listOf("KB", "MB", "GB")
+    var value = bytes.toDouble() / 1024
+    var unit = 0
+    while (value >= 1024 && unit < units.lastIndex) {
+        value /= 1024
+        unit++
+    }
+    return if (value >= 100) {
+        "${value.roundToInt()} ${units[unit]}"
+    } else {
+        "${(value * 10).roundToInt() / 10.0} ${units[unit]}"
     }
 }
 

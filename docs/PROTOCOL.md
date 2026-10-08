@@ -119,6 +119,35 @@ Cookie: <会话Cookie>
 描述符只认「键不存在」或「合法值」，空串会被严格编解码器拒绝。
 `session/create` 的每个可选字段同理。
 
+#### `session/create`：`workspaceId` 与 `cwd` 互斥
+
+这两个字段**不能同时出现**，否则服务端直接拒绝：
+
+```
+gateway/bad-request: session.create accepts workspaceId or cwd, not both
+```
+
+它们不是「碰巧冲突」的两个可选参数：**工作区本身就是一个目录**，服务端会自己做
+`cwd = workspace.path`。所以给了 `workspaceId` 之后，`cwd` 不但是多余的，
+而且是会被拒绝的。
+
+```jsonc
+// 正确：在选中的工作区里新建
+{ "request": { "workspaceId": "ws-…" } }
+
+// 正确：在一个裸目录里新建（没有对应工作区时）
+{ "request": { "cwd": "E:\\project" } }
+
+// 错误：两个都给 → gateway/bad-request
+{ "request": { "workspaceId": "ws-…", "cwd": "E:\\project" } }
+```
+
+> 这是一个**只有真机会暴露**的契约：两个键都是合法 wire 名，Kotlin 编译器
+> 和描述符校验都不会报错，只有服务端在运行时拒绝。1.1.4 就是把选中工作区的
+> id 和它的 path 一起传了出去，于是「只要选过工作区，新建对话必定失败」。
+> `test/feature-contract.test.mjs` 与 `test/regression-1.1.5.test.mjs` 里
+> 各有一条静态检查守着它。
+
 ---
 
 ## 3.5 工作区、模型目录与 token 用量（1.1.2 起）

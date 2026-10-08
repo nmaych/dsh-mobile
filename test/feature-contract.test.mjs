@@ -166,8 +166,33 @@ check('session/create guards each optional key before putting it', () => {
     'workspaceId must be guarded by a non-blank check',
   )
   assert.ok(
-    /if\s*\(!cwd\.isNullOrBlank\(\)\)\s*req\.put\("cwd"/.test(body),
-    'cwd must be guarded by a non-blank check',
+    /if\s*\(workspaceId\.isNullOrBlank\(\)\s*&&\s*!cwd\.isNullOrBlank\(\)\)\s*req\.put\("cwd"/.test(body),
+    'cwd must be guarded by a non-blank check AND by the workspace being absent',
+  )
+})
+
+check('session/create never sends workspaceId and cwd together', () => {
+  // The server rejects both keys at once outright:
+  //
+  //     session.create accepts workspaceId or cwd, not both
+  //
+  // This is not a stylistic preference — it is a hard `gateway/bad-request`, and
+  // it is invisible to the Kotlin compiler. 1.1.4 shipped `createSessionLocked`
+  // passing the selected workspace's id *and* its path, so "new conversation"
+  // failed for every user who had picked a workspace. The wire names are right;
+  // what is wrong is sending two of them.
+  const body = functionBody(dshClient, 'createSession')
+  assert.ok(
+    /if\s*\(workspaceId\.isNullOrBlank\(\)\s*&&\s*!cwd\.isNullOrBlank\(\)\)/.test(body),
+    'the cwd put must be conditional on no workspaceId being set, or the request ' +
+      'carries both keys and the server refuses it',
+  )
+  // And the caller must not hand over both either, or the guard above is the
+  // only thing standing between the app and a rejected create.
+  const locked = functionBody(viewModel, 'createSessionLocked')
+  assert.ok(
+    /if\s*\(workspaceId\.isBlank\(\)\)\s*selectedWorkspacePath\(\)\s*else\s*null/.test(locked),
+    'createSessionLocked must pass a cwd only when no workspace is selected',
   )
 })
 

@@ -37,6 +37,18 @@ sealed interface UpdateState {
     data class Available(val info: UpdateInfo) : UpdateState
     data class Downloading(val percent: Int, val received: Long, val total: Long) : UpdateState
     data class ReadyToInstall(val file: File, val info: UpdateInfo) : UpdateState
+
+    /**
+     * Downloaded and verified, but Android will not let this app launch the
+     * installer until the user grants "install unknown apps".
+     *
+     * This is a state rather than an error on purpose: the download is finished
+     * and its file is still on disk, so throwing the state away would make the
+     * user re-download a 12 MB APK to retry something that is one system toggle
+     * away. The [file] travels with the state so the retry installs what was
+     * already verified.
+     */
+    data class InstallPermissionRequired(val file: File, val info: UpdateInfo) : UpdateState
     data class Failed(val message: String) : UpdateState
 }
 
@@ -47,6 +59,14 @@ sealed interface UpdateState {
  * `versionCode`, the APK is downloaded, its SHA-256 verified, and the system
  * package installer is invoked through a FileProvider URI.
  *
+ * `notes` is **Markdown**, and is rendered as such on the settings screen. The
+ * release workflow fills it from the CHANGELOG section for the version, so it
+ * arrives with `###` headings, `-` bullets and `` `code` `` spans; showing it as
+ * one flat paragraph is what made an update prompt unreadable. It is passed
+ * through verbatim — no sanitising, no stripping — because the renderer already
+ * degrades to plain text for anything it does not recognise, and the alternative
+ * (flattening here) would lose the structure that the CHANGELOG exists to carry.
+ *
  * Manifest schema (see docs/UPDATE.md):
  * ```json
  * {
@@ -54,7 +74,7 @@ sealed interface UpdateState {
  *   "versionName": "1.1.0",
  *   "apkUrl": "https://example.com/dsh-mobile-1.1.0.apk",
  *   "sha256": "<hex>",
- *   "notes": "…",
+ *   "notes": "### 新增\n\n- …",
  *   "mandatory": false
  * }
  * ```
@@ -190,6 +210,20 @@ class UpdateManager(private val context: Context) {
             true
         }
 
+    /**
+     * The APK this manifest would install, if it has already been downloaded and
+     * verified.
+     *
+     * Used to skip a re-download: after a permission prompt the file is still
+     * there, and fetching 12 MB again to retry a system toggle would be absurd.
+     * Only the *name* is matched, which is safe because the name embeds the
+     * version and [download] deletes and replaces a partial file rather than
+     * renaming into place until the hash has matched.
+     */
+    fun downloadedFile(info: UpdateInfo): File? =
+        File(File(context.filesDir, "updates"), "dsh-mobile-${info.versionName}.apk")
+            .takeIf { it.isFile && it.length() > 0 }
+
     /** Open the "install unknown apps" screen for this app. */
     fun requestInstallPermission() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -200,8 +234,15 @@ class UpdateManager(private val context: Context) {
         runCatching { context.startActivity(intent) }
     }
 
-    /** Hand a verified APK to the system installer. */
-    fun install(file: File) {
+    /**
+     * Hand a verified APK to the system installer.
+     *
+     * @return false when the installer could not be started, so the caller can
+     *   say so instead of leaving a button that looks broken. This is reachable
+     *   even with the permission granted: a device can have no package-installer
+     *   activity at all, and `startActivity` then throws rather than returning.
+     */
+    fun install(file: File): Boolean = runCatching {
         val uri = FileProvider.getUriForFile(
             context,
             "${context.packageName}.fileprovider",
@@ -213,5 +254,5 @@ class UpdateManager(private val context: Context) {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
-    }
+    }.isSuccess
 }

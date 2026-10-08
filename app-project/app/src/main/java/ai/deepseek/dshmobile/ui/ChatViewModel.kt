@@ -679,6 +679,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * `workspaceId` is what actually puts the session in a workspace: passing a
      * `cwd` alone creates a session with that directory but does not file it
      * under the workspace, so the desktop sidebar would not show it there.
+     *
+     * The two are **mutually exclusive** on the wire — the server answers
+     * `session.create accepts workspaceId or cwd, not both` — so exactly one is
+     * sent. See [DshClient.createSession].
      */
     fun createSession() {
         val origin = prefs.serverUrl
@@ -696,12 +700,24 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Create a session on the server. The caller must hold [sessionCreation]. */
-    private suspend fun createSessionLocked(origin: String): String = dsh.createSession(
-        origin,
-        cwd = selectedWorkspacePath(),
-        workspaceId = _state.value.selectedWorkspaceId,
-    )
+    /**
+     * Create a session on the server. The caller must hold [sessionCreation].
+     *
+     * A selected workspace is named by `workspaceId` **instead of** its path, not
+     * in addition to it: the server refuses a request carrying both, and a
+     * workspace already implies its directory (`cwd = workspace.path`), so the
+     * path would be redundant even if it were accepted. Falling back to `cwd`
+     * only when nothing is selected is what keeps "new session in the chosen
+     * project" and "new session in a bare directory" the same single call.
+     */
+    private suspend fun createSessionLocked(origin: String): String {
+        val workspaceId = _state.value.selectedWorkspaceId
+        return dsh.createSession(
+            origin,
+            cwd = if (workspaceId.isBlank()) selectedWorkspacePath() else null,
+            workspaceId = workspaceId,
+        )
+    }
 
     /** The directory of the selected workspace, when one is selected. */
     private fun selectedWorkspacePath(): String? =

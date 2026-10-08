@@ -44,14 +44,19 @@ fun rememberQrScanner(onResult: (String) -> Unit): () -> Unit {
                 // Silent: the beep is the single most-complained-about part of a
                 // scanner, and the result here is obvious from the screen changing.
                 .setBeepEnabled(false)
-            // `setOrientationLocked` is deliberately not called. Its default of
-            // `true` is what makes `CaptureManager.lockOrientation()` hold the
-            // capture screen at however the phone is being held, which is the
-            // behaviour wanted here; passing `false` would remove that hold without
-            // making the screen portrait, because the library's own manifest
-            // declares `android:screenOrientation="sensorLandscape"` on its capture
-            // Activity. Landscape is also the better fit for the actual job: the
-            // code being scanned is on a wide computer screen.
+                // Portrait, via our own subclass. The library's `CaptureActivity`
+                // is declared `sensorLandscape` in *its* manifest, and that entry
+                // cannot be changed from this module, so the direction is set on
+                // `PortraitCaptureActivity` instead.
+                .setCaptureActivity(PortraitCaptureActivity::class.java)
+                // Left unlocked, so the manifest is the ONE place the direction is
+                // declared. With the library default of `true`, `CaptureManager`
+                // also calls `setRequestedOrientation` from whatever orientation
+                // it reads at creation — a second source of truth that can only
+                // ever agree or surprise. The capture screen is reached by holding
+                // the phone normally, and the pairing QR is square, so a portrait
+                // viewfinder frames it as well as a wide one.
+                .setOrientationLocked(false)
         )
     }
 }
