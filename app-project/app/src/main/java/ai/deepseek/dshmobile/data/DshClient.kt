@@ -294,7 +294,7 @@ class DshClient(private val prefs: Prefs) {
     }
 
     /**
-     * Send one unary request, retrying a connect failure once.
+     * Send one unary request, retrying a connect failure.
      *
      * This is the actual fix for "新建对话选择模型时提示连接超时".
      *
@@ -314,7 +314,7 @@ class DshClient(private val prefs: Prefs) {
      * left to try the failure propagates on the first attempt, so the app has to
      * do the retrying.
      *
-     * Only a connect timeout is retried, and only once:
+     * Only a connect timeout is retried:
      *
      *  - A connect timeout is safe by construction. The request never reached the
      *    desktop, so repeating it cannot double-apply anything. This is exactly
@@ -322,8 +322,12 @@ class DshClient(private val prefs: Prefs) {
      *    (`SocketTimeoutException && !requestSendStarted`), and it is why a
      *    *read* timeout is deliberately excluded below: there the desktop may
      *    already be acting on the request, and `session/prompt` would run twice.
-     *  - One retry, with a short pause, is enough to ride out a radio wake-up.
-     *    Retrying harder would only delay the error the user eventually needs.
+     *  - The pauses are what make the retries work, and 1.1.4 got that wrong. It
+     *    allowed one retry after 400ms — less than the radio wake-up it was
+     *    written for, so the retry landed inside the same doze and failed too.
+     *    The user was then told the desktop was unreachable at the exact moment
+     *    the mux socket proved it was not. Two retries at 1s then 2s actually
+     *    span a wake-up; a genuinely dead desktop still gives up in seconds.
      */
     private suspend fun executeUnary(
         req: Request,
@@ -339,12 +343,15 @@ class DshClient(private val prefs: Prefs) {
                     TransportErrors.isConnectTimeout(t)
                 if (!retryable) throw transportError(base, t, code)
                 attempt++
-                Log.w(TAG, "connect timed out; retrying once (attempt $attempt)")
+                // Growing pause, so the attempts are spread across the radio's
+                // wake-up window instead of clustering at its start.
+                val pause = UNARY_RETRY_DELAY_MS * attempt
+                Log.w(TAG, "connect timed out; retrying in ${pause}ms (attempt $attempt)")
                 // `delay`, not `Thread.sleep`: this runs inside `withContext`, and a
                 // blocking sleep would hold the IO thread and ignore cancellation —
                 // so a user who backed out during the pause would still be waiting
                 // for it to finish.
-                delay(UNARY_RETRY_DELAY_MS)
+                delay(pause)
             }
         }
     }
@@ -994,7 +1001,45 @@ class DshClient(private val prefs: Prefs) {
         val total: TokenUsage,
         val contextWindow: Long?,
         val contextTokens: Long?,
-    )
+        /**
+         * The session log sequence these values were taken at.
+         *
+         * `session/projections` answers with `asOfSeq`, and the live
+         * `session/control` frames carry their own `seq` in the same space. The
+         * caller uses this to seed its watermark, so a frame that predates this
+         * read cannot overwrite it with older values.
+         */
+        val asOfSeq: Long = 0L,
+    ) {
+        companion object {
+            /**
+             * Parse one `tokenUsage` projection value.
+             *
+             * `fromProjection` reads the projection's own wire names, which differ
+             * from the settlement's: the prompt side is `uncachedInputTokens` there
+             * and `inputTokens` here. Shared by the one-shot read and the live
+             * stream so the two cannot disagree about what a value means.
+             */
+            fun usageOf(value: JSONObject?): TokenUsage =
+                TokenUsage.fromProjection(value) ?: TokenUsage()
+
+            /**
+             * Parse one `contextPressure` value into (tokens, window).
+             *
+             * `projectedTokens` is the sample plus the surface's movement since it
+             * was taken, so it answers for the *next* request; `pressureTokens` is
+             * the fallback when no movement has been folded yet.
+             */
+            fun pressureOf(value: JSONObject?): Pair<Long?, Long?> {
+                if (value == null) return null to null
+                val window = value.optLong("contextWindow", 0L).takeIf { it > 0L }
+                val projected = value.optLong("projectedTokens", 0L)
+                val raw = value.optLong("pressureTokens", 0L)
+                val context = (if (projected > 0L) projected else raw).takeIf { it > 0L }
+                return context to window
+            }
+        }
+    }
 
     /**
      * Read the session's token accounting.
@@ -1012,20 +1057,131 @@ class DshClient(private val prefs: Prefs) {
         )
         if (!value.has("values") || value.isNull("values")) return null
         val values = value.optJSONObject("values") ?: return null
-        val total = TokenUsage.fromProjection(values.optJSONObject("tokenUsage")) ?: TokenUsage()
-        val pressure = values.optJSONObject("contextPressure")
-        val window = pressure?.optLong("contextWindow", 0L) ?: 0L
-        // `projectedTokens` is the sample plus the surface's movement since it was
-        // taken, so it answers for the *next* request; `pressureTokens` is the
-        // fallback when no movement has been folded yet.
-        val projected = pressure?.optLong("projectedTokens", 0L) ?: 0L
-        val raw = pressure?.optLong("pressureTokens", 0L) ?: 0L
-        val context = if (projected > 0L) projected else raw
+        val (context, window) = UsageSnapshot.pressureOf(values.optJSONObject("contextPressure"))
         return UsageSnapshot(
-            total = total,
-            contextWindow = window.takeIf { it > 0L },
-            contextTokens = context.takeIf { it > 0L },
+            total = UsageSnapshot.usageOf(values.optJSONObject("tokenUsage")),
+            contextWindow = window,
+            contextTokens = context,
+            asOfSeq = value.optLong("asOfSeq", 0L),
         )
+    }
+
+    /**
+     * Follow the host's live projection state.
+     *
+     * This is the real-time half of the token counter, and it is what makes the
+     * chip match the desktop *while a turn runs* rather than only after it ends.
+     * `session/projections` is a one-shot read, so the app could only refresh the
+     * total at a turn boundary: the figure sat still through a long turn and then
+     * jumped. The desktop has no such gap — it is subscribed to this stream.
+     *
+     * `session/control` takes **no arguments** (its descriptor declares an empty
+     * parameter list), so `args` must be exactly `{}`; the gateway rejects a
+     * request whose keys do not match the descriptor.
+     *
+     * Frames are:
+     *
+     *   - one opening `{"type":"baseline","value":{"projections":{<sessionId>:
+     *     {asOfSeq, values}}}}` covering **every** session, then
+     *   - `{"type":"projection","sessionId","key","value","seq"}` replacements.
+     *
+     * It is host-wide, not per-session: one stream serves every session the user
+     * might switch to, and the caller filters by `sessionId`.
+     */
+    fun sessionControl(origin: String): Flow<JSONObject> =
+        stream(origin, "session/control", JSONObject())
+
+    // ------------------------------------------------- forwarded user questions
+
+    /**
+     * Subscribe to the host's forwarded events, and answer the questions it asks.
+     *
+     * This is the only path that can answer `ask_user_question`, and it is the
+     * mechanism the desktop UI itself uses. The alternative — the unary
+     * `userQuestions/answer` RPC — only works once a timed question has already
+     * moved to its `continued` state, so it cannot answer the question while the
+     * user is actually being asked; by then the tool call has returned and the
+     * model has moved on. This stream is the live path.
+     *
+     * The endpoint is the gateway-internal `$events`, and its payload must be
+     * **exactly** `{"args":{}}`: the gateway validates that the args object is
+     * present and empty, and rejects anything else with
+     * `gateway/arguments-invalid`. There is no per-event subscription — the
+     * stream carries every forwarded event the host allows, and the caller
+     * filters.
+     *
+     * Frames, as `item` values:
+     *
+     *   - `{"type":"ready","clientId","host":{"home"}}` — always first, and the
+     *     `clientId` it carries is required to answer anything on this stream.
+     *   - `{"type":"emit","event","args":[…]}` — a notification; not answerable.
+     *   - `{"type":"waterfall","event","eventId","agentId","request":{…}}` —
+     *     a request waiting for an answer. See [UserQuestion].
+     *   - `{"type":"cancel","eventId"}` — the request was settled elsewhere (the
+     *     desktop answered first, or the wait expired). The UI must close.
+     *
+     * Pending waterfalls are back-filled to a stream that opens late, so a
+     * question asked while the phone was disconnected still arrives here.
+     */
+    fun forwardedEvents(origin: String): Flow<JSONObject> =
+        stream(origin, "\$events", JSONObject())
+
+    /**
+     * Answer one forwarded waterfall, or step aside.
+     *
+     * `POST /api/$events/result` is a gateway-internal unary RPC, not a
+     * registered service method, so it is called through [rpc] with the endpoint
+     * split into the namespace/method pair the envelope expects.
+     *
+     * The outcome union is exactly one of:
+     *
+     *   - `{"kind":"result","value":<answer>}` — claim the question with this
+     *     answer. The **first** answerer to return a value wins; the gateway then
+     *     sends `cancel` to every other delivery.
+     *   - `{"kind":"next"}` — decline, leaving the question for another answerer.
+     *     This is what the desktop sends when it has no listener registered, and
+     *     it is why answering is a positive act rather than a timeout.
+     *
+     * Correlation is by `(clientId, eventId)` and not by socket identity, so a
+     * result sent on a *different* HTTP connection than the stream is still
+     * accepted — the gateway looks the pair up in its own registry. That is what
+     * makes this workable from OkHttp, where the unary call and the mux socket
+     * are separate connections.
+     *
+     * A reply for a question the host has already settled is *not* an error: the
+     * gateway simply finds no pending delivery for the pair and returns success.
+     * That is the desired outcome — the desktop answered first — so there is
+     * nothing to report and nothing to retry.
+     *
+     * @throws IOException-family failures from [rpc] when the reply could not be
+     *   delivered at all, so the caller can put the question back rather than
+     *   discarding an answer the host is still waiting for.
+     */
+    suspend fun answerForwardedEvent(
+        origin: String,
+        clientId: String,
+        eventId: String,
+        answer: JSONObject?,
+    ) {
+        val outcome = if (answer == null) {
+            JSONObject().put("kind", "next")
+        } else {
+            JSONObject().put("kind", "result").put("value", answer)
+        }
+        val args = JSONObject()
+            .put("clientId", clientId)
+            .put("eventId", eventId)
+            .put("outcome", outcome)
+        // `$events/result` is a two-segment endpoint whose first segment is the
+        // literal `$events`; the envelope carries it as `<namespace>/<method>`.
+        //
+        // A transport failure is *thrown* rather than folded into a return value.
+        // The caller has to tell "the host settled this question already" from "we
+        // never reached the host": the first means the prompt is genuinely done
+        // with, and the second means the user's answer still has somewhere to go.
+        // Collapsing both into one falsy result would silently discard an answer
+        // the host is still waiting for.
+        rpc(origin, "\$events", "result", args)
     }
 
     /**
@@ -1206,15 +1362,31 @@ class DshClient(private val prefs: Prefs) {
         /**
          * Extra attempts for a unary call whose TCP connect expired.
          *
-         * One. The failure this rides out is a radio that has not woken up yet,
-         * which resolves in well under a second; anything longer is a desktop that
-         * is genuinely unreachable, and the user needs to be told rather than kept
-         * waiting.
+         * Two. A single retry is not enough for the failure this rides out, and
+         * that is the whole reason the spurious "连接超时" survived 1.1.4.
+         *
+         * The trigger is a radio that is asleep or mid-wake: the phone's Wi-Fi
+         * power-saves, a *fresh* TCP handshake is dropped while the already-open
+         * mux socket keeps working, and the connect burns its full 20s before
+         * failing. By then the radio is usually awake again, but the old code
+         * paused only 400ms and fired its one retry straight into the tail of
+         * the same doze — so it failed identically and the app reported an
+         * unreachable desktop while the desktop was, provably, still serving the
+         * mux. Two attempts spread over a few seconds is what actually covers a
+         * 1–2s wake-up, and the second is the one that succeeds.
          */
-        private const val UNARY_CONNECT_RETRIES = 1
+        private const val UNARY_CONNECT_RETRIES = 2
 
-        /** Pause before the retry, long enough for a dozing radio to come back. */
-        private const val UNARY_RETRY_DELAY_MS = 400L
+        /**
+         * Pause before the first retry; the second waits twice this.
+         *
+         * Sized against the wake-up it exists for. 400ms was shorter than the
+         * radio's own wake-up window, so the retry could not have helped: it
+         * re-sent into the same doze and the user saw a timeout for a connection
+         * that was about to work. One second, then two, spans that window with
+         * margin without making a genuinely dead desktop wait long.
+         */
+        private const val UNARY_RETRY_DELAY_MS = 1_000L
 
         private fun baseNameOf(path: String): String =
             path.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { path }

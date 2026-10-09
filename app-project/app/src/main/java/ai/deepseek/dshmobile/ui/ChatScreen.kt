@@ -389,6 +389,20 @@ fun ChatScreen(
  * grew to ~900px tall, overflowing the app bar and the transcript. FlowRow
  * instead measures every chip at its natural width and moves a chip that does
  * not fit onto the next line, so nothing is starved and nothing is dropped.
+ *
+ * Every chip is also centred on the strip's cross axis, and that is a separate
+ * fix for the landscape misalignment. `FlowRow` aligns its children to the
+ * *top* of the line by default (its `CROSS_AXIS_ALIGNMENT_TOP`), which is only
+ * harmless while every chip measures the same height. They do not: the model and
+ * workspace chips are clickable `Surface`s, and Material3 enforces a 48dp
+ * minimum interactive size on those, centring their content inside it, while the
+ * usage chip is a plain informational `Surface` and stays about one text line
+ * tall. With top alignment the usage readout therefore sat at the top of the
+ * line while its neighbours' labels sat in the middle of theirs. In portrait the
+ * chips wrap onto separate lines and the difference is invisible; in landscape
+ * they share one line, which is why the misalignment only showed up there.
+ * Centring each chip makes the two boxes agree about where the baseline is, so
+ * the strip reads as one row of chips in either orientation.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -416,17 +430,23 @@ private fun RemoteChipsRow(
             onClick = onOpenModelPicker,
             // Bound the chip so one long `provider/model` cannot swallow the
             // whole line and leave the other chips to wrap for no reason.
-            modifier = Modifier.widthIn(max = 200.dp),
+            //
+            // `align` is what keeps it level with the usage chip in landscape;
+            // see the strip's KDoc for why top alignment could not.
+            modifier = Modifier
+                .align(Alignment.CenterVertically)
+                .widthIn(max = 200.dp),
         )
         Surface(
             onClick = onOpenWorkspacePicker,
             enabled = state.connected,
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
             shape = RoundedCornerShape(6.dp),
-            // Every chip in this strip is one text line tall, whatever the row's
-            // height ends up being. Without it the incoming constraints let a chip
-            // stretch vertically and the strip grows to fill the screen.
-            modifier = Modifier.wrapContentHeight(),
+            // One text line tall, and level with the usage chip: see the strip's
+            // KDoc. Without this the constraints stretch a chip to the row height.
+            modifier = Modifier
+                .align(Alignment.CenterVertically)
+                .wrapContentHeight(),
         ) {
             Row(
                 Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
@@ -461,6 +481,10 @@ private fun RemoteChipsRow(
                 usage = state.displayUsage,
                 contextTokens = state.contextTokens,
                 contextWindow = state.contextWindow,
+                // The usage chip is the only non-clickable chip, so it is the one
+                // Material3 does *not* pad out to 48dp. It has to be centred
+                // explicitly or it sits above its neighbours in landscape.
+                modifier = Modifier.align(Alignment.CenterVertically),
             )
         }
     }

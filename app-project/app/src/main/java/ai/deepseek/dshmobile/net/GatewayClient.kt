@@ -67,14 +67,24 @@ class GatewayClient {
      * Trade a pairing code for a device token.
      *
      * @param deviceName a label the desktop will show in its device list.
+     * @param deviceId this installation's stable identity. The desktop keys its
+     *   device list by it, so pairing a second time *replaces* this phone's row
+     *   rather than adding an identical second one. Optional: the desktop keeps
+     *   its old append-only behaviour for a client that omits it.
      * @throws GatewayException with a user-facing message on failure.
      */
-    suspend fun pair(baseUrl: String, code: String, deviceName: String): String =
+    suspend fun pair(
+        baseUrl: String,
+        code: String,
+        deviceName: String,
+        deviceId: String = "",
+    ): String =
         withContext(Dispatchers.IO) {
             val base = baseUrl.trim().trimEnd('/')
             val payload = JSONObject()
                 .put("code", code.trim())
                 .put("name", deviceName)
+                .apply { if (deviceId.isNotBlank()) put("deviceId", deviceId) }
                 .toString()
 
             val req = Request.Builder()

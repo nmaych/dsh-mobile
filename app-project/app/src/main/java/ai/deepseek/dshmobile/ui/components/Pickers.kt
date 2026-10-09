@@ -48,31 +48,153 @@ import ai.deepseek.dshmobile.data.TokenUsage
 import ai.deepseek.dshmobile.ui.ModelRow
 import ai.deepseek.dshmobile.ui.WorkspaceRow
 
-/** Compact "1.2k" style token count, so a chip stays one line wide. */
-fun formatTokens(value: Long): String = when {
-    value < 1_000 -> value.toString()
-    value < 1_000_000 -> {
-        val thousands = value / 1000.0
-        if (thousands < 10) String.format(java.util.Locale.US, "%.1fk", thousands)
-        else "${(value / 1000)}k"
+/**
+ * Compact token count, matching the desktop's `formatTokens` exactly.
+ *
+ * The desktop's rule (`dsh-client-ui-chat`, `token-format.js`) is:
+ *
+ *  - below 1000, the raw integer: `517`
+ *  - below a million, thousands with an **uppercase** `K`: `12.2K`
+ *  - a million and up, millions with `M`: `1.2M`
+ *
+ * and the scaled figure keeps one decimal *only* while it is under 100 —
+ * `12.2K` but `517K`, not `517.0K`. Above that the decimal is noise.
+ *
+ * This replaced a mobile-only invention: lowercase `k`, and a different
+ * rounding rule (`%.1f` always), so the same session read `209k` on the phone
+ * and `209K` on the desktop and the two could not be compared at a glance.
+ *
+ * The boundary is worth stating because it is not obvious: `999_999` renders as
+ * `1000K`, not `1M`. The desktop rounds the *scaled* value, so 999.999
+ * thousandths rounds to 1000 and stays in the thousands unit. Reproducing that
+ * quirk is the point — "match the desktop" means matching its output, including
+ * where a tidier rule would disagree.
+ */
+fun formatTokens(value: Long): String {
+    if (value < 1_000) return value.toString()
+    val scaled = if (value < 1_000_000) value / 1_000.0 else value / 1_000_000.0
+    val unit = if (value < 1_000_000) "K" else "M"
+    val shown = if (scaled >= 100) {
+        // `Math.round`, not `kotlin.math.round`: JavaScript's `Math.round` breaks
+        // ties upward, while Kotlin's `round` breaks them to even. They disagree
+        // on exact .5 values, and this is a port of the JavaScript.
+        Math.round(scaled).toString()
+    } else {
+        val tenths = Math.round(scaled * 10)
+        // A whole number prints without its decimal part, as JavaScript does.
+        if (tenths % 10 == 0L) (tenths / 10).toString()
+        else "${tenths / 10}.${tenths % 10}"
     }
-    else -> String.format(java.util.Locale.US, "%.1fM", value / 1_000_000.0)
+    return "$shown$unit"
 }
+
+/**
+ * The cache-hit share, as a percentage string — or null when nothing was billed.
+ *
+ * A faithful port of the desktop's `formatCacheHitPercent` (decimalPlaces 0),
+ * including the part that is easy to get wrong: **a partial hit must never
+ * display as `100`**.
+ *
+ * The ordinary answer is the rounded integer percent. But when rounding would
+ * produce `100` while some prompt tokens were still *missed*, the desktop
+ * instead emits a `99.9…X` form carrying exactly enough extra precision to keep
+ * the claim true — `99.9` when a tenth of a percent would still hide the miss,
+ * more nines when it would not. Showing `100` there would tell the user the
+ * cache absorbed a prompt it did not, which is the one thing this figure exists
+ * to report.
+ *
+ * @param cacheReadTokens prompt tokens served from cache.
+ * @param promptTokens the whole billed prompt: uncached + cache read + cache write.
+ */
+fun formatCacheHitPercent(cacheReadTokens: Long, promptTokens: Long): String? {
+    if (promptTokens == 0L) return null
+    val missed = promptTokens - cacheReadTokens
+    if (missed == 0L) return "100"
+    val rounded = roundedPercentUnits(cacheReadTokens, promptTokens)
+    if (rounded < 100L) return rounded.toString()
+
+    // Rounding reached 100 with a real miss behind it, so widen the precision
+    // until the displayed figure can no longer be mistaken for a full hit.
+    var distinguishingPlaces = 1
+    var scaledDoubleGap = missed * 200
+    val denominatorTens = promptTokens / 10
+    while (scaledDoubleGap <= denominatorTens) {
+        scaledDoubleGap *= 10
+        distinguishingPlaces += 1
+    }
+    val denominatorOnes = promptTokens % 10
+    var roundedLoss = 5L
+    for (loss in 1L until 5L) {
+        val factor = loss * 2 + 1
+        val threshold = factor * denominatorTens + (factor * denominatorOnes) / 10
+        if (scaledDoubleGap <= threshold) {
+            roundedLoss = loss
+            break
+        }
+    }
+    return "99." + "9".repeat(distinguishingPlaces - 1) + (10 - roundedLoss)
+}
+
+/**
+ * Round `cacheReadTokens / denominator` to exact percent units, ties upward.
+ *
+ * The desktop computes this with an integer binary search rather than floating
+ * point, so that a large token count cannot land on the wrong side of a
+ * boundary through a rounding error. Ported as-is: the search finds the largest
+ * `units` whose half-unit boundary the ratio still clears, which is exactly
+ * round-half-up without ever forming a float.
+ */
+private fun roundedPercentUnits(cacheReadTokens: Long, denominator: Long): Long {
+    val scale = 100L
+    val doubledScale = scale * 2
+    val denominatorQuotient = denominator / doubledScale
+    val denominatorRemainder = denominator % doubledScale
+    var lower = 0L
+    var upper = scale
+    while (lower < upper) {
+        val candidate = (lower + upper + 1) / 2
+        val factor = candidate * 2 - 1
+        val threshold = factor * denominatorQuotient +
+            ceilDiv(factor * denominatorRemainder, doubledScale)
+        if (cacheReadTokens >= threshold) lower = candidate else upper = candidate - 1
+    }
+    return lower
+}
+
+/** Integer ceiling division for non-negative operands. */
+private fun ceilDiv(numerator: Long, denominator: Long): Long =
+    if (denominator == 0L) 0L else (numerator + denominator - 1) / denominator
 
 /**
  * The token-usage chip.
  *
- * Shows the session's running total, and — when the server reports a context
- * window — how full that window is, because the total alone does not tell a user
- * whether they are about to be compacted. Both figures come from the server's
- * own projections rather than being summed locally.
+ * Renders the same figure, in the same words, as the desktop's `UsagePill`, so
+ * the two can be read side by side:
+ *
+ *     {total} tok · 缓存命中 {percent}%
+ *
+ * `total` is the desktop's own definition — every billed bucket summed, output
+ * included:
+ *
+ *     uncachedInput + cacheRead + cacheWrite + output
+ *
+ * Note that this is deliberately *not* the old mobile readout (`↑209k (10.3M
+ * 缓存) ↓309k`). That form had no desktop counterpart at all, so the two clients
+ * disagreed about both the number and its shape, and neither could be checked
+ * against the other. The cache-hit share replaces the separate cache figure
+ * because it is what the desktop reports and it answers the question the raw
+ * number was being used for.
+ *
+ * The context window is kept as an extra segment. The desktop shows it in a
+ * separate dialog; on a phone the chip is the only surface there is, and "how
+ * full is the window" is the one fact that predicts an imminent compaction.
+ * It is appended after the desktop's text, so the desktop's prefix is intact.
  *
  * Every text here is pinned to a single line. The readout is monospace and made
- * of many short tokens (`↑209k`, `(10.3M`, `缓存)`), so when it was handed a
- * narrow width it broke after *every* token and the chip grew to hundreds of
- * pixels tall — tall enough to push the app bar off screen. A one-line clip
- * degrades gracefully instead: the chip stays chip-sized and long values are
- * ellipsised rather than stacked.
+ * of many short tokens, so when it was handed a narrow width it broke after
+ * *every* token and the chip grew to hundreds of pixels tall — tall enough to
+ * push the app bar off screen. A one-line clip degrades gracefully instead: the
+ * chip stays chip-sized and long values are ellipsised rather than stacked.
  */
 @Composable
 fun UsageChip(
@@ -92,6 +214,14 @@ fun UsageChip(
     // is the one thing a bare total cannot convey.
     val nearLimit = contextTokens != null && window != null &&
         window > 0 && contextTokens.toDouble() > window.toDouble() * 0.8
+
+    // The desktop's total: all four billed buckets, output included. `usage.total`
+    // is the same sum, but naming the desktop's definition here keeps the two in
+    // step if either side ever grows a bucket.
+    val total = usage.total
+    val promptTokens = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+    val cacheHit = formatCacheHitPercent(usage.cacheReadTokens, promptTokens)
+
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
         shape = RoundedCornerShape(6.dp),
@@ -113,9 +243,11 @@ fun UsageChip(
             Spacer(Modifier.width(4.dp))
             Text(
                 buildString {
-                    append("↑").append(formatTokens(usage.inputTokens))
-                    if (usage.cacheReadTokens > 0) append(" (").append(formatTokens(usage.cacheReadTokens)).append(" 缓存)")
-                    append(" ↓").append(formatTokens(usage.outputTokens))
+                    append(formatTokens(total)).append(" tok")
+                    if (cacheHit != null) {
+                        // The desktop's separator and wording, verbatim.
+                        append(" · 缓存命中 ").append(cacheHit).append("%")
+                    }
                 },
                 fontSize = 9.5.sp,
                 fontFamily = FontFamily.Monospace,

@@ -151,10 +151,31 @@ object TransportErrors {
      * True when the TCP connect itself expired, which is the one timeout that
      * really is a network problem.
      *
-     * `Socket.connect(endpoint, timeout)` reports this as
-     * `SocketTimeoutException("connect timed out")`, so the word `connect` is what
-     * separates "we never reached the desktop" from "we reached it and it was
-     * slow". Only this case justifies sending the user to check their Wi-Fi.
+     * Only this case justifies sending the user to check their Wi-Fi. It is also
+     * the only failure the app may retry, so the answer has to be *provable*
+     * rather than merely plausible.
+     *
+     * The wording is platform-specific, and the two platforms disagree:
+     *
+     *  - **Android** never says `connect timed out`. `IoBridge` hardcodes the
+     *    long form, which names the remote address, the *local* ephemeral port
+     *    and the millisecond budget:
+     *
+     *        failed to connect to /192.168.3.103 (port 19387) from
+     *        /192.168.3.104 (port 39694) after 20000ms
+     *
+     *  - **OpenJDK** says `Connect timed out` (capital C on JDK 17, lowercase on
+     *    JDK 8) — which is why the match below is case-insensitive. It matters
+     *    on the JVM and in tests, not on the phone.
+     *
+     * OkHttp does not rewrite either one: `RealConnection` wraps only
+     * `ConnectException`, so a connect *timeout* passes through verbatim.
+     *
+     * Both wordings are matched, instead of the bare substring `connect`, so the
+     * test is anchored to the two real producers. A loose substring also matched
+     * any future message that merely mentioned connecting, and this predicate
+     * gates a retry — a false positive there re-sends a request the desktop may
+     * already have acted on.
      *
      * Public because [ai.deepseek.dshmobile.data.DshClient] also uses it to decide
      * whether a request may be retried, and the two must agree: the app may only
@@ -162,10 +183,27 @@ object TransportErrors {
      * answer twice is how a retry eventually double-applies a prompt.
      */
     fun isConnectTimeout(t: Throwable): Boolean =
-        causeChain(t).any {
-            it is SocketTimeoutException &&
-                it.message?.contains("connect", ignoreCase = true) == true
+        causeChain(t).any { cause ->
+            cause is SocketTimeoutException &&
+                CONNECT_TIMEOUT_WORDINGS.any { wording ->
+                    cause.message?.contains(wording, ignoreCase = true) == true
+                }
         }
+
+    /**
+     * The two wordings a real TCP connect timeout carries.
+     *
+     * Kept as data so the classifier and the test that guards it name the same
+     * strings. Neither appears in the heartbeat message
+     * (`sent ping but didn't receive pong within …`), which is the other
+     * `SocketTimeoutException` this app can see, so the two never collide.
+     */
+    private val CONNECT_TIMEOUT_WORDINGS = listOf(
+        // Android: IoBridge.createMessageForException
+        "failed to connect to",
+        // OpenJDK: Socket.connect(endpoint, timeout)
+        "connect timed out",
+    )
 
     /** The throwable and its causes, outermost first, bounded against a cycle. */
     private fun causeChain(t: Throwable): List<Throwable> {

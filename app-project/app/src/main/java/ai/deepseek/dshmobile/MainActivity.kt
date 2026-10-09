@@ -220,5 +220,6 @@ private fun DshRoot(
                 else -> Unit
             }
         },
+        onAnswerQuestion = vm::answerQuestion,
     )
 }

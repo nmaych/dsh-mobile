@@ -41,7 +41,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
+import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.ui.components.ModelPickerDialog
+import ai.deepseek.dshmobile.ui.components.QuestionDialog
 import ai.deepseek.dshmobile.ui.components.WorkspaceDrawerRow
 import ai.deepseek.dshmobile.ui.components.WorkspacePickerDialog
 import kotlinx.coroutines.launch
@@ -84,12 +86,27 @@ fun AppShell(
     onUpdateManifestChange: (String) -> Unit,
     onCheckUpdate: () -> Unit,
     onInstallUpdate: () -> Unit,
+    onAnswerQuestion: (List<QuestionAnswer>, Boolean) -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
     var showModelPicker by remember { mutableStateOf(false) }
     var showWorkspacePicker by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    // The agent is *blocked* on this question: its tool call is suspended inside
+    // the host's waterfall, so the turn cannot advance until it is answered or the
+    // host's wait expires. It is therefore composed above the settings early
+    // return, because a question the user cannot see is a turn that cannot finish —
+    // and a user who wandered into settings is exactly the user who would never
+    // find out why the conversation stopped.
+    state.pendingQuestion?.let { pending ->
+        QuestionDialog(
+            question = pending,
+            onAnswer = { answers -> onAnswerQuestion(answers, false) },
+            onDismiss = { onAnswerQuestion(emptyList(), true) },
+        )
+    }
 
     if (showSettings) {
         SettingsScreen(

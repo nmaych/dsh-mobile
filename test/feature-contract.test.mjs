@@ -306,13 +306,25 @@ check('the projection field is `uncachedInputTokens`, not `inputTokens`', () => 
 })
 
 check('context occupancy is read from contextPressure', () => {
+  // The parsing lives in `UsageSnapshot.pressureOf` rather than inline in
+  // `sessionUsage`, because 1.1.6 reads the same projection from two places: the
+  // one-shot `session/projections` call and the live `session/control` stream.
+  // A single reader is what keeps the two from disagreeing about what
+  // `projectedTokens` means, so the assertion follows it to its new home and
+  // additionally pins that the one-shot path goes through it.
   const body = functionBody(dshClient, 'sessionUsage')
   assert.ok(
     body.includes('"contextPressure"'),
     'the context window comes from the contextPressure projection',
   )
+  assert.ok(
+    body.includes('pressureOf('),
+    'sessionUsage must read the pressure value through the shared reader, or the ' +
+      'live stream and the one-shot call can interpret it differently',
+  )
+  const reader = functionBody(dshClient, 'pressureOf')
   for (const key of ['contextWindow', 'projectedTokens', 'pressureTokens']) {
-    assert.ok(body.includes(`"${key}"`), `the context pressure reader must handle "${key}"`)
+    assert.ok(reader.includes(`"${key}"`), `the context pressure reader must handle "${key}"`)
   }
 })
 

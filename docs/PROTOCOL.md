@@ -275,7 +275,7 @@ Cookie: <会话Cookie>
 同理，`tool/result` 往往在 `tool/call` 之后的另一批事件里到达，所以
 `callId → 卡片位置` 的索引也必须跨批次保留，只在切换会话时清空。
 
-### 超时与重试（1.1.4 起）
+### 超时与重试（1.1.4 起，1.1.6 修订）
 
 两种传输各有各的超时，**不能共用一个客户端**：
 
@@ -294,18 +294,149 @@ Cookie: <会话Cookie>
 | 异常里的文字 | 真实含义 | 该说的话 |
 | --- | --- | --- |
 | `…didn't receive pong within…` | mux 心跳超时（OkHttp 的 `pingInterval`），流会自行重连 | 连接中断，正在自动重连 |
-| `connect timed out` | TCP 没连上（只由 `IoBridge.connect` 产生） | 连接超时，去查 Wi-Fi / 桌面端 |
+| `failed to connect to /… (port …) … after 20000ms`（Android）<br>`connect timed out` / `Connect timed out`（OpenJDK） | TCP 没连上 | 连接超时，去查 Wi-Fi / 桌面端 |
 | `timeout` / `Read timed out` | socket 已连上，桌面端没及时回 | 已连上，桌面端可能正忙，稍后重试 |
 
 判定用异常自带的文字而不是类型，因为三者是同一个类型。
 
-**只有连接超时会被重试，且只重试一次。** 请求根本没到桌面端，所以重复发送不会
+> **1.1.6 更正**：Android 上 `Socket.connect` 超时的原文**不是** `connect timed out`
+> ——那是 OpenJDK 的措辞（JDK 17 首字母大写，JDK 8 小写）。Android 的
+> `IoBridge.createMessageForException` 硬编码的是上面那条长文本，它会带上**本机**
+> 临时端口，正是不能回显给用户的东西。两者都含 `connect`，所以旧代码能用，
+> 但它引用的证据是错的。现在按**两个真实来源的措辞**匹配，而不是裸子串
+> `connect`：这个判定同时决定**要不要重试**，判错的代价是 `session/prompt`
+> 可能被跑两次。
+
+**只有连接超时会被重试。** 请求根本没到桌面端，所以重复发送不会
 重复执行（`session/prompt` 不会被跑两次）——这也是 OkHttp 自身 `isRecoverable`
 的条件（`SocketTimeoutException && !requestSendStarted`）。读超时**不重试**：
 那时桌面端可能已经在处理了。OkHttp 自己不会替我们重试，因为它只考虑**换一条路由**
 （`RouteSelector`），而手机只有一个 Wi-Fi、地址是字面 IP，路由只有一条。
 
-### `session/follow` 的 args
+> **1.1.6 更正**：1.1.4 只重试**一次**、且只等 **400ms**，比它自己要扛的
+> 「射频还没睡醒」（注释自己写着「1 秒内就会过去」）还短——重试必然落在同一次休眠
+> 的尾巴里，以同样的方式再失败一次，最后把一个马上就能用的连接报成「连不上」。
+> 现在是**两次、分别等 1 秒和 2 秒**，真正覆盖住那个唤醒窗口。
+> 另外报错横幅此前**从来没有被撤回**：mux 掉线是自愈的（`stream` 会用退避重开），
+> 但失败那次留下的横幅一直挂着，于是**重连成功之后**应用仍在坚称「连接超时」。
+> 现在套接字一回来就撤掉**传输类**错误；服务端错误不是自愈的，必须留着。
+
+### `session/control`：投影的实时推送（1.1.6 起）
+
+`session/projections` 是**一次性**读取，只适合在一轮结束时对账；要在一轮**进行中**
+就看到用量增长，必须订阅 `session/control`：
+
+```json
+{ "args": {} }
+```
+
+**它不带任何参数**——描述符里参数表是空的，网关会逐字校验 `args` 的键，
+多一个键就会被拒。它是 `mode: "stream"`，但走的是和其他流一样的逻辑流
+（`{"type":"open","streamId","endpoint":"session/control","payload":{"args":{}}}`）。
+
+帧有两种，而且这条流是**全 Host** 的，不是每会话一条：
+
+```json
+{ "type": "baseline",
+  "value": { "projections": { "<sessionId>": { "asOfSeq": 42, "values": { … } } } } }
+
+{ "type": "projection", "sessionId": "…", "key": "tokenUsage", "value": { … }, "seq": 43 }
+```
+
+`baseline` 覆盖**每一个**会话，所以调用方要按 `sessionId` 过滤。
+
+**必须按 `seq` 裁决**（大的赢），并且只采用**严格更新**的帧。推送和一次性读取
+是两条通道，帧可能乱序到达；不比较 `seq` 的话，一个迟到的旧帧会把计数器**往回拉**,
+而 `tokenUsage` 是累计值，往回跳就是错的。`session/projections` 的返回值里带
+`asOfSeq`，用它给水位线打底。
+
+`tokenUsage` 的 wire 视图是
+`{uncachedInputTokens, outputTokens, cacheReadTokens, cacheWriteTokens}`，
+注意 prompt 侧叫 **`uncachedInputTokens`**（未缓存输入），
+和结算事件 `assistant/message.data.usage` 里的 `inputTokens` **不是同一个键**。
+读错键不会报错，只会静默得到 0。
+
+### `$events`：转发的 Host 事件与提问回答（1.1.6 起）
+
+`ask_user_question` 需要认领 Host 的 **waterfall**（`user-questions/request`），
+这是**唯一**能在问题「正在被问」时回答它的通道。一元接口 `userQuestions/answer`
+做不到：它要求问题已进入 `continued` 状态，而那个状态只有**工具调用返回之后**才出现,
+那时模型已经往下走了。
+
+流端点是网关内部的 `$events`（注意不是 `session/*` 那种注册服务方法）：
+
+```json
+{ "args": {} }
+```
+
+**`args` 必须存在且为空对象。** 网关的校验是逐字的
+（`Reflect.ownKeys(payload.args).length !== 0` → `gateway/arguments-invalid`），
+所以多一个「顺便带上」的字段会让整条流开不起来，而且报错信息不会提示是哪个字段。
+
+帧（都是 `item` 的 `value`）：
+
+```json
+{ "type": "ready", "clientId": "…", "host": { "home": "…" } }
+{ "type": "emit", "event": "…", "args": [ … ] }
+{ "type": "waterfall", "event": "user-questions/request",
+  "eventId": "…", "agentId": "…", "request": { "questions": [ … ] } }
+{ "type": "cancel", "eventId": "…" }
+```
+
+- `ready` **一定是第一帧**，`clientId` 只在这里下发，且**随流一起消亡**。
+- `waterfall` 的 `request` 里**没有** `clientId`——它只带 `event/eventId/agentId/request`,
+  所以 `clientId` 必须由调用方从 `ready` 里带进来。
+- `request.wait.callId` 是把它和工具调用绑起来的字段，没有 `wait` 就说明这个提问
+  不挂在某个工具调用上。
+- 流**晚开也能收到积压**：pending 的 waterfall 会补发给新开的流。
+
+回答走一元 `$events/result`：
+
+```json
+{ "clientId": "…", "eventId": "…",
+  "outcome": { "kind": "result", "value": { "answers": [ … ] } } }
+```
+
+`outcome` 三种取值：`{"kind":"result","value":…}` 认领并作答（**先到先得**，
+其余投递会收到 `cancel`）；`{"kind":"next"}` 让给别人；`{"kind":"rejected","error":…}` 报错。
+
+**关联靠 `(clientId, eventId)` 这一对，不是套接字身份**——网关在自己的注册表里查这一对，
+所以一元回复可以走**另一条** HTTP 连接。这正是它在 OkHttp 上可行的原因
+（一元调用和 mux socket 是两条连接）。
+
+回答体是**整批原子提交**的：`answer.answers` 必须把该 call 的每个问题**不多不少各点一次**，
+否则整批被 `BAD_ANSWER` 拒绝，没有「下一题」的往返。
+
+```json
+{ "answers": [ { "id": "…", "selected": ["选项 label"], "custom": "自由输入" } ] }
+```
+
+- `selected` 里放的是**选项 label**，不是下标。
+- `custom` **只在非空时才给键**：它的「存在」本身在 schema 里有意义。
+
+### token 显示口径（与桌面端一致，1.1.6 起）
+
+手机此前自创了一套显示（`↑209k (10.3M 缓存) ↓309k`，小写 `k`，箭头），
+桌面端从来没有过，于是同一个会话在两个客户端上读起来是两个数。桌面端的口径是：
+
+```
+{总计} tok · 缓存命中 {百分比}%
+```
+
+其中「总计」是四个计费桶**全部相加**：未缓存输入 + 缓存读 + 缓存写 + **输出**。
+
+`formatTokens` 的规则（取自桌面端 `token-format.js`）：
+
+- 1000 以下：原样，`517`
+- 1000 ~ 100 万：**大写** `K`，缩放值**小于 100 时保留一位小数**（`12.2K`），
+  100 及以上取整（`517K`，不是 `517.0K`）
+- 100 万以上：`M`，同样规则
+- 边界：`999999` → **`1000K`**（不是 `1M`）。桌面端对**缩放后**的值取整，
+  999.999 个千位进位成 1000，单位仍是千。
+
+**部分命中绝不能显示成 `100%`**：常规答案是取整后的百分比；当取整会得到 100
+而实际仍有未命中的 token 时，改用 `99.9…X` 形式，保留刚好够用的精度。
+百分比用**整数二分**算，不经过浮点。### `session/follow` 的 args
 
 ```json
 { "request": {

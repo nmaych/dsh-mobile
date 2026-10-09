@@ -11,9 +11,11 @@ import ai.deepseek.dshmobile.data.DshClient
 import ai.deepseek.dshmobile.data.DshClient.SessionAddress
 import ai.deepseek.dshmobile.data.LiveAssistant
 import ai.deepseek.dshmobile.data.Message
+import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.data.TokenUsage
+import ai.deepseek.dshmobile.data.UserQuestion
 import ai.deepseek.dshmobile.net.ChatApi
 import ai.deepseek.dshmobile.net.GatewayClient
 import ai.deepseek.dshmobile.net.StreamEvent
@@ -25,6 +27,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.json.JSONObject
 
 /** A session row in the drawer. */
 data class SessionRow(
@@ -145,7 +148,37 @@ data class ChatUiState(
     val contextWindow: Long? = null,
     /** True when the server reported any usage, so the chip can hide otherwise. */
     val usageKnown: Boolean = false,
+    /**
+     * True when [error] came from the transport rather than from the desktop.
+     *
+     * A mux socket failure is *self-healing*: `DshClient.stream` re-opens the
+     * stream on a fresh socket with backoff, and `session/follow` replays its
+     * backlog. So a transport error is a statement about a connection that may
+     * already have been replaced by the time the user reads it, and it must be
+     * retracted when the socket comes back. A server-side error is not
+     * self-healing and must stay until the user dismisses it.
+     */
+    val errorIsTransport: Boolean = false,
+    /**
+     * The `ask_user_question` requests the agent is waiting on, oldest first.
+     *
+     * Non-empty means a turn is *blocked* on a human answer: the tool call is
+     * suspended inside the host's waterfall, so the transcript cannot progress
+     * until these are answered or the host's waits expire. The UI must therefore
+     * present them as a prompt rather than as another transcript row.
+     *
+     * A list rather than a single slot because the host delivers each waterfall
+     * exactly once per stream: a question that arrived while another was on
+     * screen would otherwise have to be dropped, and dropping it means it can
+     * never be answered — the host will not re-send it, so the tool call would sit
+     * blocked until its wait expired. Only the first is shown; the rest follow as
+     * they are answered.
+     */
+    val pendingQuestions: List<UserQuestion> = emptyList(),
 ) {
+    /** The question the UI is currently asking, if any. */
+    val pendingQuestion: UserQuestion? get() = pendingQuestions.firstOrNull()
+
     /** What the usage chip renders: settled totals plus the in-flight attempt. */
     val displayUsage: TokenUsage get() = usage + liveUsage
 }
@@ -169,8 +202,44 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     private var followJob: Job? = null
     private var usageJob: Job? = null
+    /**
+     * The live `session/control` subscription.
+     *
+     * One stream for the whole host, kept open while a session is active, so the
+     * usage chip tracks the desktop *during* a turn instead of only at its end.
+     */
+    private var controlJob: Job? = null
+    /**
+     * The `$events` subscription that carries `ask_user_question` requests.
+     *
+     * Opened once for the whole host, not per session: the stream carries
+     * forwarded events for every agent, each frame naming its own `agentId`, and
+     * re-opening it per session would drop the pending questions that the
+     * gateway back-fills to a newly opened stream.
+     */
+    private var eventsJob: Job? = null
+    /**
+     * The `clientId` of the live `$events` stream.
+     *
+     * Assigned by the host in the stream's opening `ready` frame and required on
+     * every answer, so it is captured here the moment it arrives. It is cleared
+     * whenever the stream is (re)opened, because a `clientId` from a dead stream
+     * identifies nothing — the gateway looks the pair up in a registry keyed by
+     * the live stream.
+     */
+    @Volatile private var eventsClientId: String = ""
     /** The in-flight workspace list load, superseded by a newer request. */
     private var workspaceRequest: Job? = null
+
+    /**
+     * Highest `seq` seen per projection key, for the active session.
+     *
+     * `session/control` is a live push, so frames can arrive out of order
+     * relative to a one-shot `session/projections` read taken at the same time.
+     * The host's own client resolves that by `seq` — higher wins — and this
+     * mirrors it. Cleared with the session, because `seq` is per-session.
+     */
+    private val projectionSeqs = mutableMapOf<String, Long>()
 
     /**
      * Serializes session creation.
@@ -201,6 +270,52 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             selectedWorkspaceId = prefs.workspaceId,
             activeEffort = prefs.reasoningEffort,
         )
+        // Retract a transport error the moment the mux comes back.
+        //
+        // This is the other half of the spurious "连接超时" report, and the half
+        // that 1.1.4 missed. A mux failure is not terminal: `DshClient.stream`
+        // re-opens the stream on a fresh socket, and the reconnect usually
+        // succeeds within a second. But the banner raised by the *failed* attempt
+        // stayed on screen afterwards — so the app went on asserting a timeout
+        // long after it had reconnected, and the user was left reading a warning
+        // about a connection that was, at that moment, demonstrably fine.
+        //
+        // Only a transport error is cleared this way. A server-side error (a bad
+        // model, a rejected prompt) is not self-healing, so reconnecting says
+        // nothing about it and it must survive until the user dismisses it.
+        viewModelScope.launch {
+            dsh.connectionState.collect { connected ->
+                if (!connected) return@collect
+                val current = _state.value
+                // An open mux socket is itself proof the desktop is reachable and
+                // the stored credential still authenticates — the handshake
+                // required the cookie — so it also clears a `connected = false`
+                // left behind by a unary call that failed during the blip.
+                // Without this the chips stayed greyed out and the app bar read
+                // "未连接" while the transcript streamed normally underneath.
+                if (current.errorIsTransport || !current.connected) {
+                    _state.value = current.copy(
+                        error = if (current.errorIsTransport) null else current.error,
+                        errorIsTransport = false,
+                        connected = true,
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * True when a failure is a transport problem that a reconnect can cure.
+     *
+     * Keyed on the code [DshClient] assigns, not on the message: the message is
+     * user-facing Chinese by then, and matching prose would break the moment the
+     * wording changed. Only the transport codes are listed — a server-side
+     * failure such as `unauthorized` or `http-500` is not self-healing, so
+     * reconnecting must not silently retract it.
+     */
+    private fun isTransportError(t: Throwable): Boolean {
+        val code = (t as? DshClient.DshException)?.code ?: return false
+        return code in TRANSPORT_ERROR_CODES
     }
 
     // ------------------------------------------------------------------ config
@@ -248,7 +363,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     origin = "$origin:${GatewayClient.DEFAULT_PORT}"
                 }
 
-                val token = gateway.pair(origin, code, deviceName())
+                // `installId` identifies this installation, so re-pairing
+                // replaces this phone's row on the desktop instead of leaving a
+                // dead duplicate behind: the token below overwrites the stored
+                // one, and the old record would otherwise never be usable again.
+                val token = gateway.pair(origin, code, deviceName(), prefs.installId)
                 // The old session belongs to the old desktop: stop following it
                 // before the transport is replaced, so its stream's teardown does
                 // not surface as an error over the new connection.
@@ -378,6 +497,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Disconnect from the current desktop and forget its token. */
     fun unpair() {
         detachSession()
+        // The stream identity belongs to the old authority; `reset()` fails the
+        // stream that carried it, so the id must not be reused.
+        eventsJob?.cancel()
+        eventsJob = null
+        eventsClientId = ""
         // Clear the credentials first: `reset()` re-seeds the cookie jar from
         // prefs, so doing it the other way round would leave the old cookie live.
         prefs.deviceToken = ""
@@ -388,6 +512,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             sessions = emptyList(),
             workspaces = emptyList(),
             remoteModels = emptyList(),
+            pendingQuestions = emptyList(),
             info = "已断开连接",
         )
     }
@@ -402,10 +527,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun detachSession() {
         followJob?.cancel()
         usageJob?.cancel()
+        controlJob?.cancel()
         followJob = null
         usageJob = null
+        controlJob = null
         seenSeqs.clear()
         callIndex.clear()
+        projectionSeqs.clear()
         _state.value = _state.value.copy(
             activeSessionId = null,
             activeTitle = "",
@@ -421,6 +549,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             usageKnown = false,
             contextTokens = null,
             contextWindow = null,
+            // The question belonged to the session being left. It is still
+            // pending on the host, which re-delivers it when the user returns.
+            pendingQuestions = emptyList(),
         )
     }
 
@@ -522,6 +653,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) {
                 refreshSessions()
                 refreshWorkspaces()
+                // Only worth subscribing once the credential is known good; the
+                // stream is admitted by the same fence as every other `/api` call.
+                startEvents()
             }
         }
     }
@@ -567,6 +701,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) {
                 refreshSessions()
                 refreshWorkspaces()
+                startEvents()
                 if (reopen != null) activateSession(reopen, reopenTitle.ifBlank { "会话" }, false)
             }
         }
@@ -650,8 +785,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     ) {
         followJob?.cancel()
         usageJob?.cancel()
+        controlJob?.cancel()
         seenSeqs.clear()
         callIndex.clear()
+        projectionSeqs.clear()
         _state.value = _state.value.copy(
             activeSessionId = sessionId,
             activeAddress = address,
@@ -667,8 +804,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             usageKnown = false,
             contextTokens = null,
             contextWindow = null,
+            // A question from the previous session must not survive the switch:
+            // its `clientId`/`eventId` pair belongs to that session's waterfall.
+            pendingQuestions = emptyList(),
         )
         startFollowing(sessionId, address)
+        startControl(sessionId)
         refreshUsage(sessionId)
         refreshActiveWorkspace(sessionId)
     }
@@ -752,10 +893,18 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     // `historyLoaded` is set even on failure: leaving it false
                     // would keep the loading spinner up behind the error banner,
                     // as though the transcript were still coming.
+                    //
+                    // A socket failure is flagged as a transport error so the
+                    // reconnect can retract it. `DshClient.stream` has already
+                    // given up by the time this runs (it exhausted its own
+                    // retries), so the banner is honest *now* — but the next
+                    // successful socket makes it stale, and only the flag lets
+                    // the view model know it is allowed to clear it.
                     _state.value = _state.value.copy(
                         connecting = false,
                         historyLoaded = true,
                         error = t.message ?: "订阅会话失败",
+                        errorIsTransport = isTransportError(t),
                     )
                 }
                 .collect { item ->
@@ -869,12 +1018,111 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
+     * Subscribe to the host's live projection state.
+     *
+     * This is what makes the token counter update *in real time*, the way the
+     * desktop's does. The one-shot [refreshUsage] read only ever ran at a turn
+     * boundary, so on a long turn the chip sat on a stale number and then jumped
+     * — while the desktop, subscribed to this same stream, counted up as the
+     * tokens were billed.
+     *
+     * The stream is host-wide, so it is opened once and the frames are filtered
+     * to the active session. Two frame shapes matter here:
+     *
+     *  - `baseline` carries `value.projections`, keyed by session id, each with
+     *    `asOfSeq` and `values`. It is the opening state and arrives even for a
+     *    session that has never run a turn.
+     *  - `projection` carries one `{sessionId, key, value, seq}` replacement.
+     *
+     * `seq` is compared per key and only a strictly newer frame is applied. A
+     * frame that is older than what the one-shot read already applied would
+     * otherwise walk the counter backwards, which is exactly the "counter jumps
+     * down mid-turn" bug that `usage` and `liveUsage` are kept separate to avoid.
+     */
+    private fun startControl(sessionId: String) {
+        val origin = prefs.serverUrl
+        controlJob?.cancel()
+        projectionSeqs.clear()
+        controlJob = viewModelScope.launch {
+            dsh.sessionControl(origin)
+                // A dropped control stream is not worth an error banner: it is a
+                // convenience feed, and `refreshUsage` still runs at every turn
+                // boundary, so the chip stays correct without it. The stream
+                // itself already retries the socket underneath.
+                .catch { }
+                .collect { frame ->
+                    if (_state.value.activeSessionId != sessionId) return@collect
+                    when (frame.optString("type")) {
+                        "baseline" -> {
+                            val blocks = frame.optJSONObject("value")
+                                ?.optJSONObject("projections")
+                                ?: return@collect
+                            val block = blocks.optJSONObject(sessionId) ?: return@collect
+                            val values = block.optJSONObject("values") ?: return@collect
+                            val asOf = block.optLong("asOfSeq", 0L)
+                            // The baseline is authoritative for every key it
+                            // carries, so it seeds the watermarks directly.
+                            for (key in listOf("tokenUsage", "contextPressure")) {
+                                projectionSeqs[key] = asOf
+                            }
+                            applyProjection(values.optJSONObject("tokenUsage"), values.optJSONObject("contextPressure"))
+                        }
+
+                        "projection" -> {
+                            if (frame.optString("sessionId") != sessionId) return@collect
+                            val key = frame.optString("key")
+                            if (key != "tokenUsage" && key != "contextPressure") return@collect
+                            val seq = frame.optLong("seq", 0L)
+                            // Strictly newer only: an equal seq is the same write
+                            // arriving twice, and applying it again is harmless
+                            // but pointless.
+                            if (seq <= (projectionSeqs[key] ?: Long.MIN_VALUE)) return@collect
+                            projectionSeqs[key] = seq
+                            val value = if (frame.isNull("value")) null else frame.optJSONObject("value")
+                            when (key) {
+                                "tokenUsage" -> applyProjection(value, null)
+                                else -> applyProjection(null, value)
+                            }
+                        }
+                    }
+                }
+        }
+    }
+
+    /**
+     * Fold one or both projection values into the chip's state.
+     *
+     * A null argument means "this frame did not carry that key", not "the value
+     * is empty" — the caller passes null for whichever projection the frame is
+     * not about, and the existing value is preserved.
+     *
+     * A *present but null* `tokenUsage` is a real thing (the host can clear a
+     * projection), and it maps to a zeroed total rather than being ignored.
+     */
+    private fun applyProjection(tokenUsage: JSONObject?, contextPressure: JSONObject?) {
+        val current = _state.value
+        var next = current
+        if (tokenUsage != null) {
+            next = next.copy(usage = DshClient.UsageSnapshot.usageOf(tokenUsage), usageKnown = true)
+        }
+        if (contextPressure != null) {
+            val (tokens, window) = DshClient.UsageSnapshot.pressureOf(contextPressure)
+            next = next.copy(contextTokens = tokens, contextWindow = window)
+        }
+        if (next !== current) _state.value = next
+    }
+
+    /**
      * Re-read the session's usage projection.
      *
      * The projection is authoritative and cheap, but it is a separate call from
      * the event stream, so it is refreshed on open and after each turn instead of
      * being derived locally — a locally summed total drifts as soon as a retry or
      * a compaction replaces an attempt.
+     *
+     * The live [startControl] stream keeps the chip current *during* a turn; this
+     * remains the authority at the boundaries, and the only source when the host
+     * offers no control stream.
      */
     private fun refreshUsage(sessionId: String) {
         val origin = prefs.serverUrl
@@ -892,12 +1140,145 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             result.onSuccess { snapshot ->
                 if (snapshot == null) return@onSuccess
                 if (_state.value.activeSessionId != sessionId) return@onSuccess
+                // Seed the live stream's watermark from this read, so a control
+                // frame already in flight that predates it cannot pull the
+                // counter back to older values.
+                projectionSeqs["tokenUsage"] = snapshot.asOfSeq
+                projectionSeqs["contextPressure"] = snapshot.asOfSeq
                 _state.value = _state.value.copy(
                     usage = snapshot.total,
                     contextTokens = snapshot.contextTokens,
                     contextWindow = snapshot.contextWindow,
                     usageKnown = true,
                 )
+            }
+        }
+    }
+
+    /**
+     * Subscribe to the host's forwarded events, so the agent's questions can be
+     * answered from the phone.
+     *
+     * This is the whole of fix 4. `ask_user_question` blocks the turn inside the
+     * host's `user-questions/request` waterfall, and a client only gets to answer
+     * by claiming that waterfall. The unary `userQuestions/answer` RPC cannot do
+     * it: it requires the question to be in its `continued` state, which happens
+     * only *after* the tool call has returned — by which point the model has
+     * moved on and the answer is a reply rather than a decision.
+     *
+     * One subscription for the host, because the stream is host-wide and a
+     * question can be asked for a session the user is not looking at. The frame
+     * is filtered to the active session only when *displaying* it; a question for
+     * another session is still tracked by the host and will be re-delivered.
+     *
+     * A dropped stream is not reported as an error: the gateway retries the mux
+     * underneath, and a pending waterfall is back-filled to the new stream, so
+     * the question reappears on its own. Reporting it would put a banner over a
+     * transcript that is still working.
+     */
+    private fun startEvents() {
+        val origin = prefs.serverUrl
+        if (eventsJob?.isActive == true) return
+        // A re-opened stream is issued a fresh identity, and until its `ready`
+        // frame lands there is nothing valid to answer with. Clearing it makes an
+        // answer attempted in that window fail rather than quote a dead id.
+        eventsClientId = ""
+        eventsJob = viewModelScope.launch {
+            dsh.forwardedEvents(origin)
+                .catch { }
+                .collect { frame ->
+                    when (frame.optString("type")) {
+                        "ready" -> {
+                            // Every answer must quote this, and it changes when
+                            // the stream is re-opened, so it is replaced rather
+                            // than kept.
+                            eventsClientId = frame.optString("clientId")
+                        }
+
+                        "waterfall" -> {
+                            val question = UserQuestion.fromFrame(frame, eventsClientId)
+                                ?: return@collect
+                            // Only the active session's question is shown. A
+                            // question for another session is the host's to hold;
+                            // it will still be pending when the user switches,
+                            // and the host re-delivers pending waterfalls to a
+                            // newly opened stream.
+                            if (question.agentId != _state.value.activeSessionId) return@collect
+                            // Queue rather than replace. The host delivers each
+                            // waterfall once per stream, so a question dropped
+                            // here could never be answered — it would sit blocked
+                            // until its wait expired. A duplicate is ignored so a
+                            // re-delivered frame does not ask the same thing twice.
+                            val queue = _state.value.pendingQuestions
+                            if (queue.any { it.eventId == question.eventId }) return@collect
+                            _state.value = _state.value.copy(
+                                pendingQuestions = queue + question,
+                            )
+                        }
+
+                        "cancel" -> {
+                            val eventId = frame.optString("eventId")
+                            val queue = _state.value.pendingQuestions
+                            if (queue.none { it.eventId == eventId }) return@collect
+                            _state.value = _state.value.copy(
+                                pendingQuestions = queue.filterNot { it.eventId == eventId },
+                            )
+                        }
+                    }
+                }
+        }
+    }
+
+    /**
+     * Answer the pending question, or dismiss it.
+     *
+     * @param answers one answer per question of the batch, in order. The host
+     *   validates that the batch names every question exactly once and rejects
+     *   the whole batch otherwise, so a partial list is never submitted.
+     * @param dismiss true to decline the question locally without answering it.
+     *   The host's wait is deliberately left running: declining is not the same
+     *   as cancelling the agent's question, and a `next` reply would step aside
+     *   for another answerer — which is exactly what the desktop already is. So
+     *   dismissing only hides the prompt here, and the turn stays blocked on the
+     *   desktop until it answers or the wait expires.
+     */
+    fun answerQuestion(answers: List<QuestionAnswer>, dismiss: Boolean = false) {
+        val question = _state.value.pendingQuestion ?: return
+        // Hide immediately. The answer is a round trip, and leaving the dialog up
+        // while it flies makes a tap look ignored; it is put back if the reply
+        // never reached the host.
+        _state.value = _state.value.copy(
+            pendingQuestions = _state.value.pendingQuestions.filterNot {
+                it.eventId == question.eventId
+            },
+        )
+        if (dismiss) return
+
+        val origin = prefs.serverUrl
+        val clientId = eventsClientId
+        viewModelScope.launch {
+            val payload = JSONObject().put(
+                "answers",
+                org.json.JSONArray().apply {
+                    for (answer in answers) put(answer.toJson())
+                },
+            )
+            try {
+                dsh.answerForwardedEvent(origin, clientId, question.eventId, payload)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // The reply never reached the host, so the question is still open
+                // and the user's answer is still worth sending. Put it back at the
+                // front — ahead of any question that arrived while this one was on
+                // screen, since the host is still waiting on this one.
+                val queue = _state.value.pendingQuestions
+                if (queue.none { it.eventId == question.eventId }) {
+                    _state.value = _state.value.copy(
+                        pendingQuestions = listOf(question) + queue,
+                        error = "回答没有送达桌面端，请重试。",
+                    )
+                }
             }
         }
     }
@@ -1394,12 +1775,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun clearError() {
-        _state.value = _state.value.copy(error = null, info = null)
+        _state.value = _state.value.copy(error = null, info = null, errorIsTransport = false)
     }
 
     override fun onCleared() {
         followJob?.cancel()
         usageJob?.cancel()
+        controlJob?.cancel()
+        eventsJob?.cancel()
         api.cancel()
         super.onCleared()
     }
@@ -1411,5 +1794,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
          * The prefix is load-bearing: [reconcileEchoes] finds these rows by it.
          */
         const val ECHO_PREFIX = "local-"
+
+        /**
+         * [DshClient.DshException] codes that a reconnect can cure.
+         *
+         * These are exactly the codes [DshClient.stream] itself treats as
+         * retryable (`isTransportFailure`), plus the unary transport code. A mux
+         * socket that died is replaced by the stream retry; nothing else in the
+         * list recovers on its own.
+         */
+        val TRANSPORT_ERROR_CODES = setOf(
+            "transport",
+            "ws-failure",
+            "ws-closed",
+        )
     }
 }

@@ -86,6 +86,16 @@ jobs:
       - name: Test 1.1.5 regressions
         run: node test/regression-1.1.5.test.mjs
 
+      # Guards the 1.1.6 fixes. Three are invisible to the compiler: a `FlowRow`
+      # cross-axis default that only misaligns the chip strip in landscape, a
+      # retry pause shorter than the radio wake-up it exists to ride out, and a
+      # token readout that was a mobile invention rather than the desktop's
+      # format. The fourth is a whole missing transport: answering
+      # `ask_user_question` needs the gateway's forwarded-event waterfall, whose
+      # args object must be *exactly* empty or the gateway refuses the stream.
+      - name: Test 1.1.6 regressions
+        run: node test/regression-1.1.6.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

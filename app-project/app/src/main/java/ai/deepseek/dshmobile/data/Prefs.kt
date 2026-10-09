@@ -70,6 +70,28 @@ class Prefs(context: Context) {
     /** True when the app should use the gateway path. */
     val usesGateway: Boolean get() = deviceToken.isNotBlank() && serverUrl.isNotBlank()
 
+    /**
+     * This installation's stable identity, generated once and kept forever.
+     *
+     * The desktop's device list is keyed by this, which is what makes pairing
+     * *again* replace this phone's row instead of adding a second identical one.
+     * Before it existed the desktop could only append, and the phone overwrote
+     * its own token on every pairing — leaving a dead row behind that nothing
+     * could clean up.
+     *
+     * Deliberately not a credential: it is sent in the clear with the pairing
+     * request and the desktop treats it as a label, never as proof. It is also
+     * not the Android device id, so it identifies *this install* (a reinstall
+     * pairs afresh) and carries nothing the user did not already hand over.
+     */
+    val installId: String
+        get() {
+            sp.getString(KEY_INSTALL_ID, "")?.takeIf { it.isNotBlank() }?.let { return it }
+            val generated = java.util.UUID.randomUUID().toString()
+            sp.edit { putString(KEY_INSTALL_ID, generated) }
+            return generated
+        }
+
     // ---- direct API --------------------------------------------------------
 
     var apiBaseUrl: String
@@ -126,6 +148,7 @@ class Prefs(context: Context) {
         const val KEY_SERVER_NAME = "server_name"
         const val KEY_COOKIE = "session_cookie"
         const val KEY_DEVICE_TOKEN = "device_token"
+        const val KEY_INSTALL_ID = "install_id"
         const val KEY_API_URL = "api_url"
         const val KEY_API_KEY = "api_key"
         const val KEY_API_MODEL = "api_model"

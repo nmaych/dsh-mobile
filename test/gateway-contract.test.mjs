@@ -165,6 +165,52 @@ check('the app sends the device token as the gateway expects it', () => {
   )
 })
 
+// --------------------------------------------------------- re-pairing a phone
+
+console.log('\n=== re-pairing the same phone ===')
+
+check('the app identifies itself when pairing', () => {
+  // The plugin keys its device list by this identity, which is what makes a
+  // second pairing replace this phone's row instead of adding a duplicate.
+  // Omitting it silently restores the append-only behaviour that caused
+  // "connecting twice shows two identical paired devices".
+  const gatewayClient = read(
+    'app-project/app/src/main/java/ai/deepseek/dshmobile/net/GatewayClient.kt',
+  )
+  assert.ok(
+    gatewayClient.includes('"deviceId"'),
+    'GatewayClient.pair must send the `deviceId` field; without it the desktop ' +
+      'cannot tell a re-pair from a second phone and appends a duplicate row',
+  )
+})
+
+check('the pairing identity is stable across launches', () => {
+  // A freshly generated identity on every pairing would defeat the point: the
+  // desktop would see a new device each time, which is the bug being fixed.
+  const prefs = read('app-project/app/src/main/java/ai/deepseek/dshmobile/data/Prefs.kt')
+  assert.ok(
+    prefs.includes('KEY_INSTALL_ID'),
+    'Prefs must persist the install identity under its own key',
+  )
+  assert.ok(
+    /sp\.edit\s*\{\s*putString\(KEY_INSTALL_ID/.test(prefs),
+    'the install identity must be written back to SharedPreferences, not ' +
+      'regenerated per call',
+  )
+})
+
+check('the app passes its install identity into the pairing call', () => {
+  const viewModel = read(
+    'app-project/app/src/main/java/ai/deepseek/dshmobile/ui/ChatViewModel.kt',
+  )
+  // Match the call's argument list, allowing the nested `deviceName()` call the
+  // real code has — a flat `[^)]*` would stop at that inner paren.
+  assert.ok(
+    /gateway\.pair\((?:[^()]|\([^()]*\))*installId/.test(viewModel),
+    'ChatViewModel.pairWithCode must pass prefs.installId to gateway.pair',
+  )
+})
+
 // ------------------------------------------------------------------- report
 
 console.log()
