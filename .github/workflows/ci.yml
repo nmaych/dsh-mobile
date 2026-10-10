@@ -147,7 +147,7 @@ jobs:
           packages: 'platforms;android-34 build-tools;34.0.0 platform-tools'
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # The wrapper lives in app-project/, not the repository root, because that
       # is where the Gradle build is. See docs/RELEASING.md.
