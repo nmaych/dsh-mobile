@@ -3,6 +3,7 @@ package ai.deepseek.dshmobile.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
 import ai.deepseek.dshmobile.DshApp
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Block
@@ -15,18 +16,26 @@ import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.data.TokenUsage
+import ai.deepseek.dshmobile.data.ToolFiles
+import ai.deepseek.dshmobile.data.Transcript
 import ai.deepseek.dshmobile.data.UserQuestion
+import ai.deepseek.dshmobile.data.WorkspaceFilePage
+import ai.deepseek.dshmobile.data.WorkspaceFiles
+import ai.deepseek.dshmobile.data.WorkspaceListing
 import ai.deepseek.dshmobile.net.ChatApi
 import ai.deepseek.dshmobile.net.GatewayClient
 import ai.deepseek.dshmobile.net.StreamEvent
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /** A session row in the drawer. */
@@ -175,12 +184,76 @@ data class ChatUiState(
      * they are answered.
      */
     val pendingQuestions: List<UserQuestion> = emptyList(),
+    // ---- workspace files ---------------------------------------------------
+    /**
+     * The directory listing currently on screen, or null when the browser is shut.
+     *
+     * Non-null is what makes the file browser visible, so opening and closing it
+     * is a state change rather than a separate flag that could disagree with the
+     * contents.
+     */
+    val files: WorkspaceListing? = null,
+    /** The workspace-relative directory [files] describes; empty is the root. */
+    val filesPath: String = "",
+    /** True while a listing or a file read is in flight. */
+    val filesLoading: Boolean = false,
+    /** The file opened from the browser, with its page of text. */
+    val openFile: WorkspaceFilePage? = null,
+    /** The path of [openFile], as the user sees it. */
+    val openFilePath: String = "",
+    /** Why the browser is showing an error instead of entries. */
+    val filesError: String? = null,
+    /** True while the transcript is being copied, so the action can be disabled. */
+    val copying: Boolean = false,
+    /**
+     * The workspace groups currently expanded in the drawer.
+     *
+     * Held here rather than inside the drawer composable because the drawer is
+     * rebuilt on every `state` change — a token delta recomposes the whole shell —
+     * and a `remember` inside it would still be keyed to the wrong scope once the
+     * session list is replaced. Keeping it in the state makes an expansion survive
+     * a refresh, which is the whole point of expanding it.
+     */
+    val expandedGroups: Set<String> = emptySet(),
+    /**
+     * True while the "files the assistant used" list is on screen.
+     *
+     * A flag rather than the list itself, because the *list* is derived from the
+     * transcript and the transcript keeps growing: storing a snapshot would freeze
+     * the list at the moment it was opened, and the button's own visibility would
+     * be one turn out of date. See [ChatUiState.transcriptFiles].
+     */
+    val showTranscriptFiles: Boolean = false,
 ) {
     /** The question the UI is currently asking, if any. */
     val pendingQuestion: UserQuestion? get() = pendingQuestions.firstOrNull()
 
     /** What the usage chip renders: settled totals plus the in-flight attempt. */
     val displayUsage: TokenUsage get() = usage + liveUsage
+
+    /** True when the file browser is open. */
+    val filesOpen: Boolean get() = files != null || filesError != null
+
+    /**
+     * The drawer's session list, grouped by workspace and collapsed when long.
+     *
+     * Derived rather than stored: it is a pure function of `sessions` and
+     * `workspaces`, both of which the view model already owns, so storing it too
+     * would be a second copy that can disagree with them.
+     */
+    val sessionGroups: List<SessionTree.Group>
+        get() = SessionTree.group(sessions, workspaces)
+
+    /**
+     * The files this conversation's tool calls referred to, newest first.
+     *
+     * Derived from the transcript rather than stored, so it is never stale: the
+     * transcript grows one batch at a time, and a stored copy would have to be
+     * refreshed from every one of those paths — the exact shape of bug this
+     * release is fixing elsewhere.
+     */
+    val transcriptFiles: List<ToolFiles.Ref>
+        get() = ToolFiles.ofTranscript(messages)
 }
 
 /**
@@ -270,7 +343,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             selectedWorkspaceId = prefs.workspaceId,
             activeEffort = prefs.reasoningEffort,
         )
-        // Retract a transport error the moment the mux comes back.
+        // Retract a transport error the moment the mux comes back, and never let a
+        // stale "disconnected" outlive a working connection.
         //
         // This is the other half of the spurious "连接超时" report, and the half
         // that 1.1.4 missed. A mux failure is not terminal: `DshClient.stream`
@@ -285,20 +359,40 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // nothing about it and it must survive until the user dismisses it.
         viewModelScope.launch {
             dsh.connectionState.collect { connected ->
-                if (!connected) return@collect
+                // Two directions, and the second one is what 1.1.6 still got wrong.
+                //
+                // The socket is the only authority on reachability, so its state is
+                // applied whether it went up *or* down. 1.1.6 ignored the "down"
+                // edge and only *reacted* to an "up" edge — so a banner raised
+                // while the socket was already open waited for an emission that
+                // could never come, and the app went on claiming it was
+                // disconnected over a connection that was demonstrably working.
+                // A `StateFlow` (rather than the replaying `SharedFlow` it was)
+                // means the current value can simply be read, so a collector that
+                // starts late still learns the truth instead of waiting for a
+                // change that has already happened.
                 val current = _state.value
-                // An open mux socket is itself proof the desktop is reachable and
-                // the stored credential still authenticates — the handshake
-                // required the cookie — so it also clears a `connected = false`
-                // left behind by a unary call that failed during the blip.
-                // Without this the chips stayed greyed out and the app bar read
-                // "未连接" while the transcript streamed normally underneath.
-                if (current.errorIsTransport || !current.connected) {
-                    _state.value = current.copy(
-                        error = if (current.errorIsTransport) null else current.error,
-                        errorIsTransport = false,
-                        connected = true,
-                    )
+                if (connected) {
+                    // An open mux socket is itself proof the desktop is reachable
+                    // and the stored credential still authenticates — the
+                    // handshake required the cookie — so it also clears a
+                    // `connected = false` left behind by a unary call that failed
+                    // during the blip. Without this the chips stayed greyed out and
+                    // the app bar read "未连接" while the transcript streamed
+                    // normally underneath.
+                    if (current.errorIsTransport || !current.connected) {
+                        _state.value = current.copy(
+                            error = if (current.errorIsTransport) null else current.error,
+                            errorIsTransport = false,
+                            connected = true,
+                        )
+                    }
+                } else if (current.connected && current.errorIsTransport) {
+                    // The socket dropped *and* the only thing on screen is a
+                    // transport complaint about it. Marking the UI disconnected is
+                    // honest here; a server-side error is left alone, because the
+                    // drop says nothing about it.
+                    _state.value = current.copy(connected = false)
                 }
             }
         }
@@ -316,6 +410,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     private fun isTransportError(t: Throwable): Boolean {
         val code = (t as? DshClient.DshException)?.code ?: return false
         return code in TRANSPORT_ERROR_CODES
+    }
+
+    /**
+     * The banner text for a failure, or null when the socket contradicts it.
+     *
+     * The connection-state collector retracts a transport error on the *next*
+     * socket event, which is enough while the socket is flapping. It cannot help
+     * when the socket never went down at all: a single request can fail on its own
+     * — a connect timeout that lost a race with the radio waking, a stream that
+     * exhausted its retries while another stream kept the shared mux alive — and
+     * with no state *change* there is no event to react to. The banner would then
+     * sit there asserting "无法连接" over a socket that is open at that very
+     * moment, which is the reported symptom.
+     *
+     * So the current value is consulted at the moment of the failure, not only
+     * when it changes. A live mux socket proves the desktop is reachable *and*
+     * that the stored credential still authenticates, so it outranks a failed
+     * request: the request is dropped silently rather than misreported. The
+     * original failure is still logged by `DshClient`.
+     *
+     * A server-side failure is never suppressed this way — an open socket says
+     * nothing about a rejected prompt, and hiding it would lose a real error.
+     */
+    private fun transportAwareError(message: String, t: Throwable): String? {
+        if (!isTransportError(t)) return message
+        return if (dsh.connectionState.value) null else message
     }
 
     // ------------------------------------------------------------------ config
@@ -337,6 +457,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (backend == Backend.REMOTE) {
             refreshSessions()
             refreshWorkspaces()
+            // Switching *into* remote mode is a fifth way to end up connected, and
+            // it needs the same subscription as the other four. Launching the app
+            // in API mode means `autoConnect` returned before subscribing, so
+            // without this a user who pairs, tries the API backend, and switches
+            // back would have a working conversation that could never answer a
+            // question. `startEvents` is idempotent — it returns while a job is
+            // active — so calling it here is safe when one is already running.
+            startEvents()
         } else {
             loadModels()
         }
@@ -397,6 +525,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 refreshSessions()
                 refreshWorkspaces()
+                // Subscribe to the host's forwarded events. Without this the
+                // pairing *succeeds* and every other call works, but
+                // `ask_user_question` has no channel at all: the question is
+                // delivered to whichever `$events` stream exists, and on this path
+                // none did. A freshly paired install could therefore never answer a
+                // question until the app was restarted, which is exactly the
+                // "无法回答提问" report — the feature looked absent rather than
+                // broken, because the transcript showed the tool call and nothing
+                // was listening.
+                startEvents()
             } catch (t: Throwable) {
                 _state.value = _state.value.copy(
                     connecting = false,
@@ -588,6 +726,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 refreshSessions()
                 refreshWorkspaces()
+                // Same reason as the gateway path above: the direct `dsh web`
+                // pairing is a supported way in, and it must not be the one that
+                // cannot answer questions.
+                startEvents()
             } catch (t: Throwable) {
                 _state.value = _state.value.copy(
                     connecting = false,
@@ -744,9 +886,32 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     },
                 )
             } catch (t: Throwable) {
+                // A failed *list* call is not evidence that the desktop is gone,
+                // and it must not be reported as though it were.
+                //
+                // This is the "显示无法连接但实际上连接正常" report. `refreshSessions`
+                // runs on every drawer open and after every reconnect, and one
+                // attempt can lose a race with the radio waking up — a connect
+                // timeout that is over a second later. Clearing `connected` here
+                // then greyed out the model and workspace chips and made the app
+                // bar read "未连接" over a connection that was working: the mux
+                // socket was open, the transcript was streaming, and only this one
+                // request had failed.
+                //
+                // The socket is the authority on reachability, so `connected` is
+                // left exactly as it was and the banner is flagged as transport —
+                // which lets the connection-state collector retract it the moment
+                // there is a live socket to prove it wrong. A server-side refusal
+                // (a rejected credential) is not flagged, so it stays until the
+                // user acts on it.
+                //
+                // `transportAwareError` covers the case the collector cannot: an
+                // open socket means this failure was this one request's, so there
+                // is nothing worth showing at all.
+                val transport = isTransportError(t)
                 _state.value = _state.value.copy(
-                    error = t.message ?: "无法获取会话列表",
-                    connected = false,
+                    error = transportAwareError(t.message ?: "无法获取会话列表", t),
+                    errorIsTransport = transport,
                 )
             }
         }
@@ -807,6 +972,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // A question from the previous session must not survive the switch:
             // its `clientId`/`eventId` pair belongs to that session's waterfall.
             pendingQuestions = emptyList(),
+            // The file browser is rooted at the *previous* session's workspace, so
+            // its listing describes a directory the new session may not even be
+            // able to see. Closing it is the only honest option: keeping it would
+            // offer "go up" and file reads that resolve against the wrong root.
+            files = null,
+            filesPath = "",
+            filesLoading = false,
+            openFile = null,
+            openFilePath = "",
+            filesError = null,
         )
         startFollowing(sessionId, address)
         startControl(sessionId)
@@ -1178,54 +1353,93 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun startEvents() {
         val origin = prefs.serverUrl
+        if (origin.isBlank()) return
         if (eventsJob?.isActive == true) return
         // A re-opened stream is issued a fresh identity, and until its `ready`
         // frame lands there is nothing valid to answer with. Clearing it makes an
         // answer attempted in that window fail rather than quote a dead id.
         eventsClientId = ""
         eventsJob = viewModelScope.launch {
-            dsh.forwardedEvents(origin)
-                .catch { }
-                .collect { frame ->
-                    when (frame.optString("type")) {
-                        "ready" -> {
-                            // Every answer must quote this, and it changes when
-                            // the stream is re-opened, so it is replaced rather
-                            // than kept.
-                            eventsClientId = frame.optString("clientId")
-                        }
+            // Re-opened, not opened once.
+            //
+            // `forwardedEvents` already retries a dead *socket* internally, but it
+            // gives up after its own budget (`MAX_STREAM_RETRIES`), and it also
+            // completes normally when the host ends the stream. Either way the
+            // collector returns, `.catch { }` swallows the reason, and the job
+            // finishes — after which nothing ever subscribed again. The question
+            // stream was then dead for the rest of the process's life, so a turn
+            // that asked something could never be answered and the only cure was
+            // restarting the app. A phone sleeps, changes network and loses Wi-Fi
+            // constantly, so this was reachable on any long-lived session.
+            //
+            // Re-arming is safe: a re-delivered waterfall is deduplicated by
+            // `eventId` below, and the host back-fills still-pending questions to
+            // whichever stream is open, so a question asked during the gap is not
+            // lost.
+            while (isActive) {
+                // Cleared *inside* the loop, not only before it.
+                //
+                // A `clientId` identifies one stream generation and dies with it.
+                // Clearing before the loop covers the first attempt only: on every
+                // re-arm the id from the stream that just ended stayed in the
+                // field, so a question still on screen — the host re-delivers it,
+                // so it *is* still on screen — could be answered with a dead id.
+                // The gateway finds no delivery for that pair and answers success,
+                // so the user's answer would be accepted and then silently
+                // dropped, with the question reappearing as though they had never
+                // tapped. Re-arming therefore has to start from no identity at all.
+                eventsClientId = ""
+                dsh.forwardedEvents(origin)
+                    .catch { }
+                    .collect { frame ->
+                        when (frame.optString("type")) {
+                            "ready" -> {
+                                // Every answer must quote this, and it changes when
+                                // the stream is re-opened, so it is replaced rather
+                                // than kept.
+                                eventsClientId = frame.optString("clientId")
+                            }
 
-                        "waterfall" -> {
-                            val question = UserQuestion.fromFrame(frame, eventsClientId)
-                                ?: return@collect
-                            // Only the active session's question is shown. A
-                            // question for another session is the host's to hold;
-                            // it will still be pending when the user switches,
-                            // and the host re-delivers pending waterfalls to a
-                            // newly opened stream.
-                            if (question.agentId != _state.value.activeSessionId) return@collect
-                            // Queue rather than replace. The host delivers each
-                            // waterfall once per stream, so a question dropped
-                            // here could never be answered — it would sit blocked
-                            // until its wait expired. A duplicate is ignored so a
-                            // re-delivered frame does not ask the same thing twice.
-                            val queue = _state.value.pendingQuestions
-                            if (queue.any { it.eventId == question.eventId }) return@collect
-                            _state.value = _state.value.copy(
-                                pendingQuestions = queue + question,
-                            )
-                        }
+                            "waterfall" -> {
+                                val question = UserQuestion.fromFrame(frame, eventsClientId)
+                                    ?: return@collect
+                                // Only the active session's question is shown. A
+                                // question for another session is the host's to hold;
+                                // it will still be pending when the user switches,
+                                // and the host re-delivers pending waterfalls to a
+                                // newly opened stream.
+                                if (question.agentId != _state.value.activeSessionId) return@collect
+                                // Queue rather than replace. The host delivers each
+                                // waterfall once per stream, so a question dropped
+                                // here could never be answered — it would sit blocked
+                                // until its wait expired. A duplicate is ignored so a
+                                // re-delivered frame does not ask the same thing twice.
+                                val queue = _state.value.pendingQuestions
+                                if (queue.any { it.eventId == question.eventId }) return@collect
+                                _state.value = _state.value.copy(
+                                    pendingQuestions = queue + question,
+                                )
+                            }
 
-                        "cancel" -> {
-                            val eventId = frame.optString("eventId")
-                            val queue = _state.value.pendingQuestions
-                            if (queue.none { it.eventId == eventId }) return@collect
-                            _state.value = _state.value.copy(
-                                pendingQuestions = queue.filterNot { it.eventId == eventId },
-                            )
+                            "cancel" -> {
+                                val eventId = frame.optString("eventId")
+                                val queue = _state.value.pendingQuestions
+                                if (queue.none { it.eventId == eventId }) return@collect
+                                _state.value = _state.value.copy(
+                                    pendingQuestions = queue.filterNot { it.eventId == eventId },
+                                )
+                            }
                         }
                     }
-                }
+                // The stream ended. Pause before re-arming, and do not depend on
+                // the failure to be slow: `stream` gives up immediately when the
+                // socket cannot be opened at all (a dead desktop, a rejected
+                // credential), and re-subscribing in a tight loop would then spin
+                // a core and hammer the gateway with handshakes. The delay also
+                // stops a genuinely closed endpoint from turning into a hot loop,
+                // while still reconnecting within a second of a transient drop.
+                delay(EVENTS_RETRY_DELAY_MS)
+            }
         }
     }
 
@@ -1576,9 +1790,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 .onFailure {
+                    // The catalog is the slowest unary call the app makes, so a
+                    // timeout here is the *most* likely of all of them to be the
+                    // desktop being busy rather than unreachable — which is
+                    // exactly the report this flag exists to avoid.
                     _state.value = _state.value.copy(
                         loadingModels = false,
-                        error = it.message ?: "无法获取模型列表",
+                        error = transportAwareError(it.message ?: "无法获取模型列表", it),
+                        errorIsTransport = isTransportError(it),
                     )
                 }
         }
@@ -1696,9 +1915,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     )
                 }
                 .onFailure {
+                    // Same reasoning as `refreshSessions`: this runs on every
+                    // reconnect and on opening the workspace picker, so one lost
+                    // race with the radio waking up must not be reported as a
+                    // broken connection. A live socket suppresses it entirely.
                     _state.value = _state.value.copy(
                         loadingWorkspaces = false,
-                        error = it.message ?: "无法获取工作区列表",
+                        error = transportAwareError(it.message ?: "无法获取工作区列表", it),
+                        errorIsTransport = isTransportError(it),
                     )
                 }
         }
@@ -1778,6 +2002,200 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(error = null, info = null, errorIsTransport = false)
     }
 
+    // ---------------------------------------------------------- workspace files
+
+    /**
+     * Open the file browser at the active session's workspace root.
+     *
+     * The scope is the **session** id, not the workspace id: `workspaceFiles`
+     * resolves its first argument as a session lookup and takes that session's
+     * `cwd` as the root. A workspace id names something else entirely and the
+     * gateway answers with a lookup failure rather than listing the wrong place.
+     *
+     * A session is required, so this is a no-op without one — there is no
+     * workspace to browse until a conversation exists to define it, and guessing
+     * the sandbox root would show files the session cannot actually reach.
+     */
+    fun openFiles(path: String = "") {
+        val sessionId = _state.value.activeSessionId ?: run {
+            _state.value = _state.value.copy(
+                files = WorkspaceListing(path, emptyList(), false),
+                filesPath = path,
+                openFile = null,
+                openFilePath = "",
+                filesError = "请先打开或新建一个会话，文件浏览以该会话的工作区为根目录。",
+            )
+            return
+        }
+        val origin = prefs.serverUrl
+        if (origin.isBlank()) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(
+                filesLoading = true,
+                filesError = null,
+                openFile = null,
+                openFilePath = "",
+            )
+            try {
+                val listing = dsh.listWorkspaceFiles(origin, sessionId, path)
+                _state.value = _state.value.copy(
+                    files = listing,
+                    filesPath = path,
+                    filesLoading = false,
+                    filesError = null,
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                _state.value = _state.value.copy(
+                    filesLoading = false,
+                    // Keep whatever listing is already on screen: a failed
+                    // descent should not also throw away the directory the user
+                    // was reading, which would leave them with nothing to go back
+                    // to.
+                    filesError = t.message ?: "无法读取该目录",
+                )
+            }
+        }
+    }
+
+    /** Open a subdirectory from the listing currently on screen. */
+    fun openFilesChild(name: String) {
+        openFiles(WorkspaceFiles.childOf(_state.value.filesPath, name))
+    }
+
+    /** Go up one level, or do nothing at the workspace root. */
+    fun openFilesParent() {
+        val parent = WorkspaceFiles.parentOf(_state.value.filesPath) ?: return
+        openFiles(parent)
+    }
+
+    /** Read one file from the workspace into the viewer. */
+    fun openWorkspaceFile(path: String) {
+        val sessionId = _state.value.activeSessionId ?: return
+        val origin = prefs.serverUrl
+        if (origin.isBlank()) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(filesLoading = true, filesError = null)
+            try {
+                val page = dsh.readWorkspaceFile(origin, sessionId, path)
+                _state.value = _state.value.copy(
+                    openFile = page,
+                    openFilePath = path,
+                    filesLoading = false,
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                _state.value = _state.value.copy(
+                    filesLoading = false,
+                    filesError = t.message ?: "无法读取该文件",
+                )
+            }
+        }
+    }
+
+    /** Close the opened file and return to the listing. */
+    fun closeWorkspaceFile() {
+        _state.value = _state.value.copy(openFile = null, openFilePath = "")
+    }
+
+    /** Close the whole file browser. */
+    fun closeFiles() {
+        _state.value = _state.value.copy(
+            files = null,
+            filesPath = "",
+            filesLoading = false,
+            openFile = null,
+            openFilePath = "",
+            filesError = null,
+        )
+    }
+
+    // ------------------------------------------------------------------- copy
+
+    /**
+     * The active transcript as Markdown, for the clipboard.
+     *
+     * Rendering happens on a background dispatcher because a long session is
+     * thousands of blocks, and the copy is triggered from a tap: doing that
+     * string building on the main thread would drop frames exactly while the user
+     * is looking for feedback that the tap registered.
+     */
+    fun copyTranscript(onReady: (String) -> Unit) {
+        if (_state.value.copying) return
+        _state.value = _state.value.copy(copying = true)
+        val messages = _state.value.messages
+        val title = _state.value.activeTitle
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.Default) {
+                Transcript.toMarkdown(messages, title)
+            }
+            _state.value = _state.value.copy(copying = false)
+            onReady(text)
+        }
+    }
+
+    /**
+     * Copy one message, for the long-press action on a bubble.
+     *
+     * This is the action users actually reach for: "复制" next to the thing being
+     * read, not "copy the whole conversation" in the app bar. The Markdown
+     * rendering is shared with the whole-transcript export so a copied answer and
+     * a copied conversation agree about how a code block or a tool card is
+     * written — two renderers would drift.
+     *
+     * Only the message's own text is offered to the clipboard for a *user*
+     * message; an assistant entry keeps its reasoning and tool cards, because for
+     * an answer those are part of what was said.
+     */
+    fun copyMessage(message: Message, onReady: (String) -> Unit) {
+        viewModelScope.launch {
+            val text = withContext(Dispatchers.Default) {
+                Transcript.messageMarkdown(message).trim()
+            }
+            if (text.isNotBlank()) onReady(text)
+        }
+    }
+
+    /**
+     * Expand or collapse one workspace group in the drawer.
+     *
+     * The key is the group's workspace id, with the empty string naming the
+     * fallback group — the same key [SessionTree.group] produces, so the two cannot
+     * disagree about which group is open.
+     */
+    fun toggleGroup(workspaceId: String) {
+        val current = _state.value.expandedGroups
+        _state.value = _state.value.copy(
+            expandedGroups = if (workspaceId in current) current - workspaceId
+            else current + workspaceId,
+        )
+    }
+
+    /**
+     * Open the file browser on the files the transcript referred to.
+     *
+     * "查看 AI 提供的文件" is a different question from "browse the workspace": the
+     * user does not want to navigate to a file, they want the one the assistant
+     * just produced. So the list is derived from the tool calls and shown directly,
+     * and opening one reads it through the same `workspaceFiles/read` call the
+     * browser uses.
+     */
+    fun openTranscriptFiles() {
+        // Deliberately does not touch `filesError`. That field belongs to the
+        // *workspace browser*, and `filesOpen` is defined as "the browser has
+        // content or an error" — writing an error here would pop the browser open
+        // behind this dialog. The caller only offers the action when the list is
+        // non-empty, so there is nothing to report anyway.
+        _state.value = _state.value.copy(showTranscriptFiles = true)
+    }
+
+    /** Close the list of files the transcript referred to. */
+    fun closeTranscriptFiles() {
+        _state.value = _state.value.copy(showTranscriptFiles = false)
+    }
+
     override fun onCleared() {
         followJob?.cancel()
         usageJob?.cancel()
@@ -1808,5 +2226,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             "ws-failure",
             "ws-closed",
         )
+
+        /**
+         * How long to wait before re-subscribing to the forwarded-event stream.
+         *
+         * Long enough that a permanently closed endpoint cannot become a hot loop
+         * (the collector returns immediately when the socket will not open), short
+         * enough that a transient drop does not leave `ask_user_question`
+         * unanswerable for a noticeable time. The host back-fills pending
+         * waterfalls to a stream that opens late, so a question asked during the
+         * pause still arrives.
+         */
+        const val EVENTS_RETRY_DELAY_MS = 1_000L
     }
 }

@@ -15,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
+import ai.deepseek.dshmobile.data.WorkspaceFiles
 import ai.deepseek.dshmobile.ui.AppShell
 import ai.deepseek.dshmobile.ui.ChatViewModel
 import ai.deepseek.dshmobile.ui.UpdateStateHolder
@@ -203,14 +204,21 @@ private fun DshRoot(
                 // left `UpdateManager.download` unreachable from the UI: checking
                 // for updates could report a new version but never fetch it.
                 is UpdateState.Available -> {
-                    val existing = updater.downloadedFile(current.info)
-                    if (existing != null) {
-                        // Verified on an earlier attempt (typically one that stopped
-                        // at the permission prompt); reuse it instead of spending
-                        // another 12 MB.
-                        installVerified(existing, current.info)
-                    } else {
-                        scope.launch {
+                    scope.launch {
+                        val existing = updater.downloadedFile(current.info)
+                        // Reuse only a file that still hashes to what the manifest
+                        // advertises. Existence alone is not evidence: a partial
+                        // file left by a killed process, or an older release that
+                        // shares the version name, would otherwise be handed
+                        // straight to the installer and fail there with an error
+                        // naming none of that.
+                        if (existing != null && updater.verify(existing, current.info)) {
+                            installVerified(existing, current.info)
+                        } else {
+                            // A file that failed verification is stale, not
+                            // useful: leaving it would make every retry take the
+                            // same dead branch.
+                            existing?.delete()
                             updater.download(current.info).collect { updateHolder.value = it }
                         }
                     }
@@ -221,5 +229,23 @@ private fun DshRoot(
             }
         },
         onAnswerQuestion = vm::answerQuestion,
+        onOpenFiles = { vm.openFiles() },
+        onOpenFilesChild = vm::openFilesChild,
+        // The dialog names an entry by its *name*, because that is all the wire
+        // carries — `workspaceFiles/list` strips each child's absolute path. The
+        // read call needs the full workspace-relative path, so it is joined onto
+        // the directory currently being browsed.
+        onOpenWorkspaceFile = { name ->
+            vm.openWorkspaceFile(WorkspaceFiles.childOf(vm.state.value.filesPath, name))
+        },
+        onCloseWorkspaceFile = vm::closeWorkspaceFile,
+        onFilesUp = vm::openFilesParent,
+        onFilesReload = { vm.openFiles(vm.state.value.filesPath) },
+        onCloseFiles = vm::closeFiles,
+        onCopyTranscript = vm::copyTranscript,
+        onCopyMessage = vm::copyMessage,
+        onOpenTranscriptFiles = vm::openTranscriptFiles,
+        onCloseTranscriptFiles = vm::closeTranscriptFiles,
+        onToggleGroup = vm::toggleGroup,
     )
 }

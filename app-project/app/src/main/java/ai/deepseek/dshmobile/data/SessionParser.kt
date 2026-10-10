@@ -47,6 +47,19 @@ data class Message(
      * turn, which is every user and system row.
      */
     val turn: Int? = null,
+    /**
+     * How long this entry took, when that is knowable.
+     *
+     * Only a merged turn has one: it is the span from the first to the last step
+     * settlement of that turn, which is the one duration the log can actually
+     * prove. A single-step message reports 0 rather than "0 seconds" — the log
+     * records when an event was *written*, not how long the model took to produce
+     * it, so a one-step turn's own timestamp says nothing about its duration and
+     * inventing a number would be worse than showing none.
+     *
+     * A turn whose steps share a single timestamp is also 0, for the same reason.
+     */
+    val durationMs: Long = 0L,
 ) {
     val plainText: String
         get() = blocks.filterIsInstance<Block.Text>().joinToString("\n") { it.text }
@@ -543,6 +556,25 @@ object SessionParser {
 
         if (thinkingAt >= 0) blocks[thinkingAt] = Block.Reasoning(thinking.toString(), parts)
 
+        // The turn's span: the earliest and latest step timestamps it has. This is
+        // the only duration the log can prove — it records when each event was
+        // *written*, so the span across a turn's steps is real elapsed time, while
+        // a single-step turn has no span at all and is reported as 0 (see
+        // [Message.durationMs]).
+        //
+        // A zero timestamp means "the log did not say", so those steps are skipped
+        // rather than treated as the epoch: including one would report a duration
+        // of ~56 years.
+        var earliest = Long.MAX_VALUE
+        var latest = 0L
+        for (message in group) {
+            val t = message.time
+            if (t <= 0L) continue
+            if (t < earliest) earliest = t
+            if (t > latest) latest = t
+        }
+        val duration = if (latest > earliest && earliest != Long.MAX_VALUE) latest - earliest else 0L
+
         // The merged entry keeps the first settlement's id, because that is the id
         // the transcript has already rendered and the list keys on. `Role` becomes
         // ASSISTANT: the group is one assistant turn, and a lone `TOOL` row folded
@@ -551,6 +583,7 @@ object SessionParser {
             role = Role.ASSISTANT,
             blocks = blocks,
             streaming = group.any { it.streaming },
+            durationMs = duration,
         )
     }
 

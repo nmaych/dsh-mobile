@@ -614,12 +614,17 @@ check('the client id comes from the stream, not from guesswork', () => {
   )
   const events = viewModel.slice(viewModel.indexOf('private fun startEvents('))
   assert.match(
-    events.slice(0, 900),
+    events,
     /"ready"/,
     'the ready frame is where the client id comes from',
   )
+  // Anchored to the `ready` branch rather than a fixed character window: the
+  // body legitimately grows as comments are added, and a window that silently
+  // stops covering the branch turns this into a test of the comment length.
+  const readyAt = events.indexOf('"ready"')
+  const readyBranch = events.slice(readyAt, events.indexOf('"waterfall"', readyAt))
   assert.match(
-    events.slice(0, 900),
+    readyBranch,
     /eventsClientId\s*=/,
     'the ready frame must store the client id',
   )
@@ -867,19 +872,30 @@ check('the CHANGELOG link block defines 1.1.6', () => {
   )
 })
 
-check('the Gradle defaults are 1.1.6 / 10106', () => {
-  // `release-logic.test.mjs` already pins these against the newest CHANGELOG
-  // heading; this names the specific values so a mistake is reported here too.
+check('the Gradle defaults match the newest CHANGELOG entry', () => {
+  // This used to name the literal `1.1.6` / `10106`, which made the suite fail
+  // on every later release for a reason that had nothing to do with 1.1.6 —
+  // the values are *supposed* to move. What 1.1.6 actually depends on is the
+  // invariant, which `release-logic.test.mjs` already enforces in full; the
+  // check is repeated here only so a mistake is reported by both suites.
   const gradle = read('app-project/app/build.gradle.kts')
-  assert.match(
-    gradle,
-    /DSH_VERSION_NAME"\)\s*\?:\s*"1\.1\.6"/,
-    'the default version name must be 1.1.6',
+  const name = /System\.getenv\("DSH_VERSION_NAME"\)\s*\?:\s*"([^"]+)"/.exec(gradle)
+  const code = /System\.getenv\("DSH_VERSION_CODE"\)\s*\?:\s*"(\d+)"/.exec(gradle)
+  assert.ok(name, 'the default version name must be a literal in build.gradle.kts')
+  assert.ok(code, 'the default version code must be a literal in build.gradle.kts')
+
+  const newest = /^## \[(\d+\.\d+\.\d+)\]/m.exec(changelog)
+  assert.ok(newest, 'the CHANGELOG must open with a released version heading')
+  assert.equal(
+    name[1],
+    newest[1],
+    `build.gradle.kts defaults to ${name[1]} but the newest CHANGELOG entry is ${newest[1]}`,
   )
-  assert.match(
-    gradle,
-    /DSH_VERSION_CODE"\)\s*\?:\s*"10106"/,
-    'the default version code must be 10106',
+  const [major, minor, patch] = newest[1].split('.').map(Number)
+  assert.equal(
+    Number(code[1]),
+    major * 10000 + minor * 100 + patch,
+    `the default version code ${code[1]} must match ${newest[1]}`,
   )
 })
 

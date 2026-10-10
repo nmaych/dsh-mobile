@@ -3,6 +3,7 @@ package ai.deepseek.dshmobile.ui.components
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,6 +23,7 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -45,16 +47,47 @@ import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.ToolLabel
 
 @Composable
-fun MessageBubble(message: Message, modifier: Modifier = Modifier) {
+fun MessageBubble(
+    message: Message,
+    modifier: Modifier = Modifier,
+    /**
+     * Long-press handler, or null to disable it.
+     *
+     * Nullable rather than a no-op default so the gesture can be left off where it
+     * has nothing to copy: a `SystemBubble` carries a notice like "已停止生成", and
+     * offering "复制" for it would promise something the user did not ask for.
+     */
+    onCopy: (() -> Unit)? = null,
+) {
     when (message.role) {
-        Role.USER -> UserBubble(message, modifier)
-        Role.ASSISTANT -> AssistantBubble(message, modifier)
+        Role.USER -> UserBubble(message, modifier, onCopy)
+        Role.ASSISTANT -> AssistantBubble(message, modifier, onCopy)
         Role.SYSTEM, Role.TOOL -> SystemBubble(message, modifier)
     }
 }
 
+/**
+ * The long-press gesture that copies one message.
+ *
+ * `combinedClickable` rather than `clickable`: a plain tap on a bubble has no
+ * meaning here, and binding copy to it would fire on every scroll that ends with a
+ * finger down. A long press is the platform's own idiom for "act on this item",
+ * and it is what the user asked for.
+ *
+ * `onClick` is left as an empty lambda rather than omitted because
+ * `combinedClickable` requires one; a long press still reports haptic feedback, so
+ * the gesture is discoverable without a visual affordance on every bubble.
+ *
+ * `combinedClickable` is still marked experimental in this Compose version, so the
+ * opt-in is declared here rather than at every call site.
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+private fun Modifier.longPressCopy(enabled: Boolean, onCopy: (() -> Unit)?): Modifier =
+    if (!enabled || onCopy == null) this
+    else this.combinedClickable(onClick = {}, onLongClick = onCopy)
+
 @Composable
-private fun UserBubble(message: Message, modifier: Modifier) {
+private fun UserBubble(message: Message, modifier: Modifier, onCopy: (() -> Unit)?) {
     Row(
         modifier = modifier.fillMaxWidth().padding(vertical = 4.dp),
         horizontalArrangement = Arrangement.End,
@@ -64,6 +97,7 @@ private fun UserBubble(message: Message, modifier: Modifier) {
                 .widthIn(max = 320.dp)
                 .clip(RoundedCornerShape(16.dp, 16.dp, 4.dp, 16.dp))
                 .background(MaterialTheme.colorScheme.primary)
+                .longPressCopy(enabled = true, onCopy = onCopy)
                 .padding(horizontal = 13.dp, vertical = 9.dp)
         ) {
             Column {
@@ -90,7 +124,7 @@ private fun UserBubble(message: Message, modifier: Modifier) {
 }
 
 @Composable
-private fun AssistantBubble(message: Message, modifier: Modifier) {
+private fun AssistantBubble(message: Message, modifier: Modifier, onCopy: (() -> Unit)?) {
     Row(modifier = modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Box(
             Modifier
@@ -112,6 +146,7 @@ private fun AssistantBubble(message: Message, modifier: Modifier) {
                 .weight(1f)
                 .clip(RoundedCornerShape(4.dp, 16.dp, 16.dp, 16.dp))
                 .background(MaterialTheme.colorScheme.surface)
+                .longPressCopy(enabled = true, onCopy = onCopy)
                 .padding(horizontal = 12.dp, vertical = 9.dp)
         ) {
             for (block in message.blocks) {
@@ -131,8 +166,54 @@ private fun AssistantBubble(message: Message, modifier: Modifier) {
                 Spacer(Modifier.height(6.dp))
                 TypingDots()
             }
+            // The turn's duration, when the log can prove one. Placed after the
+            // content rather than in the header so it reads as a footnote to the
+            // answer instead of competing with it.
+            formatDuration(message.durationMs)?.let { label ->
+                Spacer(Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Schedule,
+                        contentDescription = null,
+                        modifier = Modifier.size(11.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        label,
+                        fontSize = 10.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
+}
+
+/**
+ * A duration as a short human-readable label, or null when there is nothing to say.
+ *
+ * Null for zero and negative: a single-step turn has no measurable span (see
+ * [Message.durationMs]), and rendering "用时 0 秒" would assert a measurement that
+ * was never taken. Under a second the label is suppressed for the same reason —
+ * the log's timestamps are whole milliseconds of *write* time, so a sub-second span
+ * is indistinguishable from two events written in the same tick.
+ *
+ * Seconds are rounded rather than truncated so a 59.6 s turn does not read as
+ * "59 秒" and then appear to be a minute off from the one beside it.
+ */
+internal fun formatDuration(durationMs: Long): String? {
+    if (durationMs < 1_000L) return null
+    val totalSeconds = Math.round(durationMs / 1000.0)
+    if (totalSeconds < 60L) return "用时 ${totalSeconds} 秒"
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    if (minutes < 60L) {
+        return if (seconds == 0L) "用时 $minutes 分钟" else "用时 $minutes 分 $seconds 秒"
+    }
+    val hours = minutes / 60
+    val remMinutes = minutes % 60
+    return if (remMinutes == 0L) "用时 $hours 小时" else "用时 $hours 小时 $remMinutes 分"
 }
 
 @Composable

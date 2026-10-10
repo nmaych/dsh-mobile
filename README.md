@@ -39,6 +39,12 @@
   把它注册成工作区
 - **更换模型**：按服务商挑选模型，支持推理强度的模型还能单独选强度
 - **查看 token 消耗**：当前会话的累计用量，以及上下文窗口占用了多少
+- **回答助手的提问**：助手用 `ask_user_question` 问你时，直接在手机上选或填写，
+  它就会继续往下做（不需要回到电脑前）
+- **复制对话**：把当前对话导出成 Markdown 放进剪贴板，带说话人标题、
+  思考过程和工具调用，可以直接贴进笔记或 issue
+- **查看工作区文件**：逐层浏览当前会话工作区里的目录并打开文件看内容
+  （根目录就是该会话的 `cwd`，所以看到的正是那个对话里的 agent 能碰到的东西）
 
 界面呈现与桌面端一致：用户气泡、助手回复、可折叠的「思考过程」、
 可展开的工具调用卡片（含参数与输出）、以及 Markdown 正文
@@ -284,6 +290,9 @@ node test/session-fold.test.mjs       # 会话事件 → 对话记录的折叠�
 node test/regression-1.1.3.test.mjs   # 连接报错文案 / 子会话地址 / 芯片行布局
 node test/regression-1.1.4.test.mjs   # edge-to-edge 系统栏 / 自动滚动让位 / 回合合并 / 工具标签
 node test/regression-1.1.5.test.mjs   # 互斥 wire 字段 / 扫码竖屏 / 更新说明 Markdown / 应用内下载
+node test/regression-1.1.6.test.mjs   # 横屏芯片对齐 / 超时判定与撤回 / token 口径 / 提问回答通道
+node test/regression-1.1.7.test.mjs   # 提问通道的订阅与重连 / 下载状态 / 误报断连 / 复制 / 查看文件
+node test/regression-1.1.8.test.mjs   # 长按复制单条 / AI 提供文件 / 对话时长 / 按工作区分组折叠
 node test/repo-hygiene.test.mjs       # gradlew 可执行位、LF/shebang、workflow 调用位置
 ```
 
@@ -301,6 +310,15 @@ node test/repo-hygiene.test.mjs       # gradlew 可执行位、LF/shebang、work
 本仓库改不动；更新说明一直是 Markdown，只是被当成纯文本画了出来；
 而应用内下载的问题是**少了一个按钮**——`UpdateManager.download` 根本没有调用方，
 这种「代码写了但没人用」的缺口没有任何编译器会提。
+
+1.1.7 的三个修复还是同一类，而且都是**「写对了，但没接上」**：提问通道
+（`$events`）整条都实现对了，却只在五条连接路径（四条建连 + 一次模式切换）里的两条被订阅，
+而且断了就再也不重连、重新订阅时还留着上一代流的 `clientId`；
+下载流程的失败会从 flow 里抛出去，**直接终结那个正在更新界面的协程**，
+于是一次失败的下载和一次没反应的点击在屏幕上完全一样；
+`connected` 会被一次失败的**列表请求**清掉，而那只是一次可能和射频唤醒抢跑的请求。
+两个新功能也各带一个同类的坑：`workspaceFiles` 的第一个参数是**会话查找**而不是普通值
+（传工作区 id 会静默解析不到），`read` 的 `range` **每个字段都可选但参数本身必填**。
 
 `repo-hygiene` 守的是另一类：**只在别人机器上坏掉的东西**。`gradlew` 缺可执行位
 让 Linux CI 报 `./gradlew: Permission denied`（退出码 126），而 Windows 上

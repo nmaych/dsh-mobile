@@ -34,6 +34,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -66,12 +68,15 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
+import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.ui.components.MessageBubble
 import ai.deepseek.dshmobile.ui.components.ModelChip
@@ -143,11 +148,16 @@ fun ChatScreen(
     onDismissError: () -> Unit,
     onOpenModelPicker: () -> Unit,
     onOpenWorkspacePicker: () -> Unit,
+    onOpenFiles: () -> Unit,
+    onCopyTranscript: (((String) -> Unit)) -> Unit,
+    onCopyMessage: (Message, (String) -> Unit) -> Unit,
+    onOpenTranscriptFiles: () -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     val bottomSlackPx = with(LocalDensity.current) { BOTTOM_SLACK.roundToPx() }
+    val clipboard = LocalClipboardManager.current
 
     // The transcript is the durable log with each turn's steps reassembled into the
     // one response it was, plus the in-flight draft joined onto its own turn.
@@ -291,6 +301,44 @@ fun ChatScreen(
                         IconButton(onClick = onRefresh) {
                             Icon(Icons.Default.Refresh, contentDescription = "刷新")
                         }
+                        // Both actions are offered only when they can do
+                        // something: copying an empty transcript would put a
+                        // heading and "暂无内容" on the clipboard, and the file
+                        // browser is rooted at a session's workspace, so with no
+                        // session there is no root to show.
+                        if (state.messages.isNotEmpty()) {
+                            IconButton(
+                                onClick = { onCopyTranscript { text ->
+                                    clipboard.setText(AnnotatedString(text))
+                                } },
+                                enabled = !state.copying,
+                            ) {
+                                Icon(
+                                    Icons.Default.ContentCopy,
+                                    contentDescription = "复制对话",
+                                )
+                            }
+                        }
+                        if (state.activeSessionId != null) {
+                            IconButton(onClick = onOpenFiles) {
+                                Icon(
+                                    Icons.Default.FolderOpen,
+                                    contentDescription = "查看文件",
+                                )
+                            }
+                            // "查看 AI 提供的文件": the files this conversation's
+                            // tool calls named, without navigating the workspace.
+                            // Offered only when there are any, so the button never
+                            // leads to an empty list.
+                            if (state.transcriptFiles.isNotEmpty()) {
+                                IconButton(onClick = onOpenTranscriptFiles) {
+                                    Icon(
+                                        Icons.Default.Description,
+                                        contentDescription = "查看助手用到的文件",
+                                    )
+                                }
+                            }
+                        }
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "设置")
@@ -342,7 +390,14 @@ fun ChatScreen(
                         verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         items(rendered, key = { it.id }) { msg ->
-                            MessageBubble(msg)
+                            MessageBubble(
+                                message = msg,
+                                onCopy = {
+                                    onCopyMessage(msg) { text ->
+                                        clipboard.setText(AnnotatedString(text))
+                                    }
+                                },
+                            )
                         }
                     }
                 }

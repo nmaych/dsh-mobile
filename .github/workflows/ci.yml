@@ -96,6 +96,27 @@ jobs:
       - name: Test 1.1.6 regressions
         run: node test/regression-1.1.6.test.mjs
 
+      # Guards the 1.1.7 fixes and features. Three of the fixes are again
+      # invisible to the compiler: a stream that was opened from only two of the
+      # four paths that connect and was never re-opened once it ended, an update
+      # download whose failure killed the collector updating the screen, and a
+      # `connected` flag cleared by a failed *list* call on a working connection.
+      # The two features add the first `workspaceFiles` calls — a namespace whose
+      # first argument is a session lookup and whose third is required even though
+      # every field inside it is optional.
+      - name: Test 1.1.7 regressions
+        run: node test/regression-1.1.7.test.mjs
+
+      # Guards the 1.1.8 changes. Two of them are corrections to 1.1.7's own
+      # features — copy meant "long-press this message", not "export the whole
+      # conversation", and the file browser answered "where is that file" when the
+      # user was asking "what did it just make" — and two are new: a per-turn
+      # duration that must only be shown when the log can prove one, and a drawer
+      # grouped by workspace with long groups collapsed. The grouping and duration
+      # logic are pure functions and are diff-tested against pinned inputs.
+      - name: Test 1.1.8 regressions
+        run: node test/regression-1.1.8.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

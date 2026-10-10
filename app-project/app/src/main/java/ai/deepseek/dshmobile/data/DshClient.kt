@@ -1,19 +1,16 @@
 package ai.deepseek.dshmobile.data
 
 import android.util.Log
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Cookie
 import okhttp3.CookieJar
@@ -59,8 +56,6 @@ import java.util.concurrent.TimeUnit
  *     `item` frames followed by `end` or `error`.
  */
 class DshClient(private val prefs: Prefs) {
-
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ------------------------------------------------------------- cookie jar
 
@@ -431,8 +426,24 @@ class DshClient(private val prefs: Prefs) {
      */
     @Volatile private var socketUrl: String = ""
 
-    private val _connectionState = MutableSharedFlow<Boolean>(replay = 1, extraBufferCapacity = 8)
-    val connectionState: SharedFlow<Boolean> = _connectionState.asSharedFlow()
+    /**
+     * Whether the shared mux socket is currently open.
+     *
+     * A `StateFlow`, not a `SharedFlow`, and that is the point. This is the only
+     * *authoritative* statement about whether the desktop is reachable: the mux
+     * handshake requires the stored credential, so an open socket proves both
+     * reachability and authentication at once, while a failed unary call proves
+     * neither — it may simply have lost a race with the radio waking up.
+     *
+     * A replaying `SharedFlow` cannot answer "is it up *right now*": it only ever
+     * pushes changes, so a consumer that raised a banner while the socket was
+     * already open waited for an emission that would never come. That is exactly
+     * how the app came to insist it was disconnected over a working connection.
+     * A `StateFlow` always has a current value, so the state can be *read* as
+     * well as observed.
+     */
+    private val _connectionState = MutableStateFlow(false)
+    val connectionState: StateFlow<Boolean> = _connectionState.asStateFlow()
 
     private fun wsUrl(origin: String): String {
         val o = origin.trim().trimEnd('/')
@@ -448,7 +459,7 @@ class DshClient(private val prefs: Prefs) {
 
     private val listener = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            scope.launch { _connectionState.emit(true) }
+            _connectionState.value = true
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -471,7 +482,7 @@ class DshClient(private val prefs: Prefs) {
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "ws failure: ${t.message}")
-            scope.launch { _connectionState.emit(false) }
+            _connectionState.value = false
             // The socket URL is the only address in hand here, and it carries the
             // same host:port the user needs to be told about. The `ws-failure`
             // code is kept so the mux retry in `stream` still recognises it.
@@ -489,7 +500,7 @@ class DshClient(private val prefs: Prefs) {
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            scope.launch { _connectionState.emit(false) }
+            _connectionState.value = false
             // A *normal* close still means this socket is unusable. Leaving it
             // cached made every later stream open onto a dead connection and hang
             // forever, which is what "连接异常" looked like in practice.
@@ -993,6 +1004,70 @@ class DshClient(private val prefs: Prefs) {
             path = w?.optString("path") ?: path,
             title = w?.optString("title").orEmpty(),
         )
+    }
+
+    // --------------------------------------------------------- workspace files
+
+    /**
+     * List one directory inside a session's workspace.
+     *
+     * The first argument is a **lookup**, not a value: the host resolves
+     * `workspaceFileScopeId` to a live session and uses that session's `cwd` as
+     * the workspace root, so it must be the **session id**. Passing a workspace
+     * id resolves to nothing and the gateway answers with a lookup failure — it
+     * does not fall back to the sandbox root, which is the behaviour worth
+     * knowing because the two ids look interchangeable.
+     *
+     * @param path workspace-relative, or absolute. Empty means the workspace
+     *   root. Directories are confined to the workspace
+     *   (`workspace-file/outside-workspace`); a *file* outside it may still be
+     *   read, but not listed.
+     */
+    suspend fun listWorkspaceFiles(
+        origin: String,
+        sessionId: String,
+        path: String,
+    ): WorkspaceListing {
+        val value = rpc(
+            origin, "workspaceFiles", "list",
+            JSONObject()
+                .put("workspaceFileScopeId", sessionId)
+                .put("path", path),
+        )
+        return WorkspaceFiles.listingOf(value)
+    }
+
+    /**
+     * Read a page of a text file inside a session's workspace.
+     *
+     * `range` is always sent, even when it carries nothing. Its *fields* are all
+     * optional, but the parameter itself is not: the descriptor declares it as a
+     * required `json` argument, and `assertExactArguments` on the gateway refuses
+     * an args object with a missing key. Omitting it because "it has no required
+     * fields" is exactly the mistake that ships as a feature that silently does
+     * nothing.
+     *
+     * @param offset 1-based first line, matching the server's own numbering.
+     * @param limit lines to return; the server caps this and refuses a larger
+     *   value rather than shortening it, so callers stay under the cap.
+     */
+    suspend fun readWorkspaceFile(
+        origin: String,
+        sessionId: String,
+        path: String,
+        offset: Int = 1,
+        limit: Int? = null,
+    ): WorkspaceFilePage {
+        val range = JSONObject().put("offset", offset)
+        if (limit != null) range.put("limit", limit)
+        val value = rpc(
+            origin, "workspaceFiles", "read",
+            JSONObject()
+                .put("workspaceFileScopeId", sessionId)
+                .put("path", path)
+                .put("range", range),
+        )
+        return WorkspaceFiles.pageOf(value)
     }
 
     // ------------------------------------------------------------------ usage

@@ -414,6 +414,80 @@ Cookie: <会话Cookie>
 - `selected` 里放的是**选项 label**，不是下标。
 - `custom` **只在非空时才给键**：它的「存在」本身在 schema 里有意义。
 
+### `workspaceFiles`：查看工作区文件（1.1.7 起）
+
+命名空间 `workspaceFiles`，五个方法：`list`、`read`、`readBytes`、`stat`、`changes`
+（后两个本应用没用）。都是**普通一元调用**，走 `POST /api/workspaceFiles/<method>`。
+
+这个命名空间有两处**看起来可以简化、实际会静默失效**的地方，是它全部的价值所在。
+
+#### 第一个参数是**查找**，值是**会话 id**
+
+```json
+{ "workspaceFileScopeId": "session-…", "path": "" }
+```
+
+`workspaceFileScopeId` 是描述符里的 wire 名，而它的 `source` 是 **`lookup`**，
+不是 `json`：宿主把它解析成一个**活着的会话**，然后取那个会话的 `cwd`
+（`header.cwd ?? sandboxPolicy.workspaceRoot`）作为工作区根目录。
+
+所以：
+
+- 传的必须是**会话 id**。传**工作区 id** 解析不到任何东西，网关会回一个查找失败——
+  它**不会**退回到沙箱根目录。两种 id 长得几乎一样，这是最容易搞错的一处。
+- 「浏览桌面端的文件」因此**不是一个功能**，而是一个刻意的边界：能看到的就是
+  那个对话里的 agent 能碰到的东西。
+
+#### `read` 的第三个参数 `range` 是**必填**的
+
+```json
+{ "workspaceFileScopeId": "session-…", "path": "src/index.ts",
+  "range": { "offset": 1, "limit": 200 } }
+```
+
+`range` 里**每个字段都是可选的**（`offset` 默认 1，`limit` 默认取上限），
+但**参数本身不是**：描述符把它声明成必需的 `json` 参数，
+网关的 `assertExactArguments` 会拒绝缺少这个键的 `args`，报
+`gateway/arguments-invalid: … missing "range"`。
+
+「它没有必填字段，所以可以省略」正是那种会变成一个静默失效功能的判断。
+所以 `range` **永远都发**，哪怕里面什么都不放。
+
+#### `list` 的返回
+
+```json
+{ "path": "src",
+  "entries": [ { "name": "index.ts", "type": "file", "size": 1234 },
+               { "name": "util", "type": "directory" } ],
+  "truncated": false }
+```
+
+- `type` 只有 `file` / `directory` / `other` 三种。
+- **`size` 只在 `file` 上有**，目录没有（不要当成 0）。
+- 每个子项**只有名字和元数据，没有绝对路径**：`list` 故意把解析后的目标剥掉了，
+  所以完整路径要在客户端拼（`父目录 + "/" + name`）。
+- `truncated` 为真表示服务端**截断**了列表。**必须告诉用户**——
+  一份看起来完整的残缺列表，正是用户据此断定「这个文件不存在」的原因。
+- 目录**被限制在工作区内**：绝对路径指向工作区之外会得到
+  `workspace-file/outside-workspace`。单个**文件**在工作区之外反而**允许**读。
+
+#### `read` 的返回
+
+```json
+{ "offset": 1, "text": "…", "lines": 200, "eof": false,
+  "absolutePath": "/home/u/proj/src/index.ts", "version": "…", "bytes": 12345 }
+```
+
+- `offset` 是 **1 基**的行号，和服务端自己的编号一致。
+- `eof` 说明这一页是否到达最后一行。不能靠「行数够不够」推断：
+  正好结束在最后一行、和被行数上限截断，这两种情况从行数上看不出区别。
+
+常见错误码：`workspace-file/not-found`、`workspace-file/not-directory`、
+`workspace-file/not-regular-file`、`workspace-file/not-text`（含 NUL 字节，不是文本）、
+`workspace-file/too-large`、`workspace-file/outside-workspace`。
+
+上限：单页 5000 行、单次列举 2000 项、文本读取 2 MiB、整文件 32 MiB。
+
 ### token 显示口径（与桌面端一致，1.1.6 起）
 
 手机此前自创了一套显示（`↑209k (10.3M 缓存) ↓309k`，小写 `k`，箭头），
