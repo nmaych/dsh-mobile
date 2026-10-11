@@ -51,15 +51,15 @@ import androidx.compose.ui.unit.sp
  * confirm button copies everything at once for the case where that *is* what is
  * wanted. Neither path is hidden behind the other.
  *
- * ## Why the text is the rendered Markdown, not the raw source
+ * ## Why the text is the plain bubble text, not the Markdown export
  *
- * The body shown is [text], which the caller has already rendered through
- * `Transcript.messageMarkdown` — the same renderer every other copy path uses, so
- * a copied bubble and a copied conversation cannot disagree about how a code block
- * or a tool card is written. Rendering it in monospace rather than as Markdown is
- * deliberate: this dialog exists to be *selected from*, and a rendered view would
- * hide the syntax characters (the `#`, the backticks) that the user may well be
- * trying to copy.
+ * The body shown is [text], which the caller has rendered with
+ * `Transcript.messagePlainText` since 1.2.1 — the words visible on the bubble,
+ * with no role heading, timestamp, quoted reasoning or fenced tool JSON. 1.2.0
+ * fed this sheet the *export* format instead, and pasting it elsewhere produced
+ * the 乱码 report: Markdown scaffolding the user never saw wrapped around what
+ * they did. Monospace is still deliberate: the dialog exists to be *selected
+ * from*, and a rendered view would hide exactly the characters being copied.
  */
 @Composable
 fun CopyMessageDialog(

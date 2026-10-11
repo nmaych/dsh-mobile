@@ -1147,6 +1147,23 @@ class DshClient(private val prefs: Prefs) {
          */
         val agentPreset: String? = null,
         /**
+         * The session's current goal, when the host reports one.
+         *
+         * Rides the same response as the token figures for the same reason the
+         * presets do: one more value in the same `values` object, one fewer round
+         * trip. Null covers both a session without a goal and a host without the
+         * goal projection — the sheet treats them the same by hiding the section.
+         */
+        val goal: GoalState? = null,
+        /**
+         * The session's todo list, when the host reports one.
+         *
+         * Null means the `todos` key was absent — a host without the todo tool —
+         * while an empty list is a real "nothing written this turn", because the
+         * host clears the projection at every `turn/start`.
+         */
+        val todos: List<TodoItem>? = null,
+        /**
          * The session log sequence these values were taken at.
          *
          * `session/projections` answers with `asOfSeq`, and the live
@@ -1215,6 +1232,14 @@ class DshClient(private val prefs: Prefs) {
             // preset: the one-shot path and the live `session/control` frames must
             // not disagree about where the value lives.
             agentPreset = AgentPresets.currentOf(value),
+            // Same one-response rule for the goal and the todo list: both ride the
+            // `values` object this call already fetched.
+            goal = GoalState.currentOf(values.opt("goal")),
+            todos = when (val t = values.opt("todos")) {
+                null -> null
+                JSONObject.NULL -> emptyList()
+                else -> TodoItem.listOf(t)
+            },
             asOfSeq = value.optLong("asOfSeq", 0L),
         )
     }

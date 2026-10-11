@@ -46,6 +46,37 @@ object Transcript {
         return out.toString().trimEnd() + "\n"
     }
 
+    /**
+     * One message as plain text — exactly the words the user sees, nothing else.
+     *
+     * 1.2.0 copied the *Markdown export* of a message, which is written for a
+     * reader outside the app: role headings (`## 助手`), timestamps, quoted
+     * reasoning and fenced tool payloads. Pasted into a normal chat box that
+     * scaffolding is what the report called 乱码 — characters the user never saw
+     * on the bubble, wrapped around the words they did. The plain text is the
+     * body blocks only, in display order, separated the way the bubble renders
+     * them; a tool call contributes its readable summary line rather than its
+     * raw JSON, and a reasoning block is skipped because its collapsed box is
+     * not part of the reply being read.
+     */
+    fun messagePlainText(message: Message): String {
+        val out = StringBuilder()
+        for (block in message.blocks) {
+            val line = when (block) {
+                is Block.Text -> block.text.trim().takeIf { it.isNotEmpty() }
+                is Block.ToolCall -> ToolLabel.describe(block.name, block.input).takeIf { it.isNotEmpty() }
+                // The reasoning box is collapsed by default, so its words are not
+                // what the user is looking at; copying them would be another
+                // surprise, which is the bug being fixed here.
+                is Block.Reasoning -> null
+                is Block.Notice -> block.text.trim().takeIf { it.isNotEmpty() }
+            } ?: continue
+            if (out.isNotEmpty()) out.append("\n\n")
+            out.append(line)
+        }
+        return out.toString()
+    }
+
     /** One message as a Markdown fragment, without a trailing blank line. */
     fun messageMarkdown(message: Message): String {
         val blocks = message.blocks.mapNotNull { blockMarkdown(it) }

@@ -154,6 +154,16 @@ jobs:
       - name: Test 1.2.0 regressions
         run: node test/regression-1.2.0.test.mjs
 
+      # Guards the 1.2.1 changes. The copy sheet now carries the bubble's plain
+      # text instead of the Markdown export (the export's role headings, quoted
+      # reasoning and fenced tool JSON were what the 乱码 report was pasting);
+      # the per-turn duration is the `turn/start` → `turn/end` wall-clock pair
+      # instead of the span between settlement timestamps, which hid single-step
+      # turns and under-reported long ones; and the goal/todo projections are
+      # watched on the live control stream and rendered in a sheet of their own.
+      - name: Test 1.2.1 regressions
+        run: node test/regression-1.2.1.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

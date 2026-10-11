@@ -16,9 +16,9 @@ plugins {
 // Keep these in step with the newest CHANGELOG entry: the scheme is
 // major*10000 + minor*100 + patch, so 1.2.0 is 10200. See docs/RELEASING.md.
 // ---------------------------------------------------------------------------
-val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10200").toIntOrNull()
+val appVersionCode: Int = (System.getenv("DSH_VERSION_CODE") ?: "10201").toIntOrNull()
     ?: error("DSH_VERSION_CODE must be an integer")
-val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.2.0"
+val appVersionName: String = System.getenv("DSH_VERSION_NAME") ?: "1.2.1"
 
 // ---------------------------------------------------------------------------
 // Release signing.

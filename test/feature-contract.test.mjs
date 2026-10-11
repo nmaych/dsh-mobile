@@ -423,8 +423,8 @@ check('the tool-call index is cleared with the session and shared across batches
   // The index must outlive a single fold() call: a tool/result arrives in a
   // later batch than the tool/call that created its card.
   assert.ok(
-    /SessionParser\.fold\(fresh,\s*durable,\s*callIndex\)/.test(viewModel) ||
-      /SessionParser\.fold\(fresh,\s*_state\.value\.messages,\s*callIndex\)/.test(viewModel),
+    /SessionParser\.fold\(fresh,\s*durable,\s*callIndex(?:\s*,\s*turnStarts)?\)/.test(viewModel) ||
+      /SessionParser\.fold\(fresh,\s*_state\.value\.messages,\s*callIndex(?:\s*,\s*turnStarts)?\)/.test(viewModel),
     'fold() must be given the long-lived callIndex, not a fresh map',
   )
   assert.ok(

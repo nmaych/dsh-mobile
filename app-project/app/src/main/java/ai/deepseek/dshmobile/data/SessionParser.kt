@@ -62,14 +62,10 @@ data class Message(
     /**
      * How long this entry took, when that is knowable.
      *
-     * Only a merged turn has one: it is the span from the first to the last step
-     * settlement of that turn, which is the one duration the log can actually
-     * prove. A single-step message reports 0 rather than "0 seconds" — the log
-     * records when an event was *written*, not how long the model took to produce
-     * it, so a one-step turn's own timestamp says nothing about its duration and
-     * inventing a number would be worse than showing none.
-     *
-     * A turn whose steps share a single timestamp is also 0, for the same reason.
+     * Measured only from the matching `turn/start` and `turn/end` event times.
+     * Step settlement times do not cover the first model call or the last tool
+     * result; using their span made single-step turns disappear and long turns
+     * show implausibly short durations. Zero means the boundary is unavailable.
      */
     val durationMs: Long = 0L,
 ) {
@@ -234,6 +230,7 @@ object SessionParser {
         events: List<JSONObject>,
         previous: List<Message> = emptyList(),
         callIndex: CallIndex = mutableMapOf(),
+        turnStarts: MutableMap<Int, Long> = mutableMapOf(),
     ): Folded {
         val out = previous.toMutableList()
         var title: String? = null
@@ -273,10 +270,31 @@ object SessionParser {
 
             when (type) {
                 // ---------------------------------------------------- turn flow
-                "turn/start" -> openTurn = data.optInt("turn", 0)
+                "turn/start" -> {
+                    val turn = data.optInt("turn", -1)
+                    openTurn = turn.takeIf { it >= 0 }
+                    if (turn >= 0 && time > 0L) turnStarts[turn] = time
+                }
 
                 "turn/end" -> {
                     openTurn = null
+                    val turn = data.optInt("turn", -1)
+                    // 1.2.1: the duration is the `turn/start` → `turn/end` wall-clock
+                    // span, not the span between the first and last *settlement*.
+                    // Settlements are written when a model call returns, so they miss
+                    // the first call's thinking time and the final tool run; a
+                    // single-step turn had no span at all and showed nothing. The
+                    // boundary pair covers the whole turn, and `turn/end` is written
+                    // in a `finally`, so every completion path carries one.
+                    val started = turnStarts.remove(turn)
+                    if (started != null && time > started) {
+                        val duration = time - started
+                        // The log can contain notices between steps. Give the final
+                        // duration to the final assistant settlement of this turn;
+                        // all preceding steps remain unlabelled when displayed alone.
+                        val last = out.indexOfLast { it.turn == turn && it.role == Role.ASSISTANT }
+                        if (last >= 0) out[last] = out[last].copy(durationMs = duration)
+                    }
                     val reason = data.optJSONObject("reason")
                     when (reason?.optString("kind")) {
                         "error" -> {
@@ -661,24 +679,11 @@ object SessionParser {
 
         if (thinkingAt >= 0) blocks[thinkingAt] = Block.Reasoning(thinking.toString(), parts)
 
-        // The turn's span: the earliest and latest step timestamps it has. This is
-        // the only duration the log can prove — it records when each event was
-        // *written*, so the span across a turn's steps is real elapsed time, while
-        // a single-step turn has no span at all and is reported as 0 (see
-        // [Message.durationMs]).
-        //
-        // A zero timestamp means "the log did not say", so those steps are skipped
-        // rather than treated as the epoch: including one would report a duration
-        // of ~56 years.
-        var earliest = Long.MAX_VALUE
-        var latest = 0L
-        for (message in group) {
-            val t = message.time
-            if (t <= 0L) continue
-            if (t < earliest) earliest = t
-            if (t > latest) latest = t
-        }
-        val duration = if (latest > earliest && earliest != Long.MAX_VALUE) latest - earliest else 0L
+        // Only the completed turn's boundary pair measures its duration. The
+        // final settlement carries it even when a notice split the assistant
+        // steps into separate display groups. A streaming draft has no boundary
+        // and must never reset a completed measurement to zero.
+        val duration = group.lastOrNull { it.durationMs > 0L }?.durationMs ?: 0L
 
         // The merged entry keeps the first settlement's id, because that is the id
         // the transcript has already rendered and the list keys on. `Role` becomes

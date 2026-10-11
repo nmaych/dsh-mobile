@@ -255,6 +255,8 @@ private fun DshRoot(
         onCloseAgentPresetPicker = vm::closeAgentPresetPicker,
         onOpenDeliverables = vm::openDeliverables,
         onCloseDeliverables = vm::closeDeliverables,
+        onOpenGoalTasks = vm::openGoalTasks,
+        onCloseGoalTasks = vm::closeGoalTasks,
         onToggleGroup = vm::toggleGroup,
     )
 }

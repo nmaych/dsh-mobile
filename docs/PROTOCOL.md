@@ -356,6 +356,40 @@ Cookie: <会话Cookie>
 和结算事件 `assistant/message.data.usage` 里的 `inputTokens` **不是同一个键**。
 读错键不会报错，只会静默得到 0。
 
+### `goal` / `todos` 投影：当前目标与任务清单（1.2.1 起）
+
+服务端注册了两个可读投影单元，都走 `session/projections` 的一次性读取和
+`session/control` 的实时推送，wire 视图键分别是 **`goal`** 和 **`todos`**：
+
+```json
+// values.goal —— 有目标时；没有目标是 JSON null
+{ "goal": { "id": "…", "revision": 3, "objective": "…",
+            "phase": "active|paused|blocked|complete",
+            "blockedReason": { "code": "…", "message": "…" },
+            "maxGoalRounds": 256 },
+  "roundsStarted": 4, "createdAt": …, "updatedAt": … }
+
+// values.todos —— 整表快照；首写之前是 JSON null
+[ { "content": "第一步", "status": "pending|in_progress|completed" } ]
+```
+
+驱动事件（客户端只读投影即可，不必自己折事件）：
+
+| 事件 | 对投影的影响 |
+|---|---|
+| `goal/change`、`user/message(source.kind == "goal")` | 重放规则折叠出当前目标；视图是**裁剪过的** `{goal, roundsStarted, createdAt, updatedAt}` |
+| `todo/write` | **整表替换**（last-write-wins），`data.todos` 就是完整清单 |
+| `turn/start` | **清空 `todos`**（回到 null）——每回合开始清单是空的，这是设计而不是异常 |
+
+两个读取要点：
+
+1. **`null` 是真实状态**。`goal` 为 null 是「这个会话没有目标」；`todos` 为 null
+   是「本回合还没写过清单」。一次性读取里 `values` 缺键则是宿主没装对应工具，
+   两种情况都应当隐藏入口，而不是显示空表。
+2. **`goal` 的视图是裁剪对象**，不是裸字符串（对比 `agentPreset`）；
+   `todos` 的视图是数组。用 `optJSONObject`/`optJSONArray` 读，
+   读错形状得到的是静默的 null。
+
 ### `$events`：转发的 Host 事件与提问回答（1.1.6 起）
 
 `ask_user_question` 需要认领 Host 的 **waterfall**（`user-questions/request`），

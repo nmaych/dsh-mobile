@@ -57,6 +57,7 @@ import ai.deepseek.dshmobile.ui.components.AgentPresetPickerDialog
 import ai.deepseek.dshmobile.ui.components.ApprovalDialog
 import ai.deepseek.dshmobile.ui.components.DeliverablesDialog
 import ai.deepseek.dshmobile.ui.components.FilesDialog
+import ai.deepseek.dshmobile.ui.components.GoalsTasksDialog
 import ai.deepseek.dshmobile.ui.components.ModelPickerDialog
 import ai.deepseek.dshmobile.ui.components.PermissionPickerDialog
 import ai.deepseek.dshmobile.ui.components.QuestionDialog
@@ -139,6 +140,8 @@ fun AppShell(
     onCloseAgentPresetPicker: () -> Unit,
     onOpenDeliverables: () -> Unit,
     onCloseDeliverables: () -> Unit,
+    onOpenGoalTasks: () -> Unit,
+    onCloseGoalTasks: () -> Unit,
     onToggleGroup: (String) -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
@@ -217,6 +220,17 @@ fun AppShell(
                 onOpenFiles()
             },
             onDismiss = onCloseDeliverables,
+        )
+    }
+
+    // The goal/todo sheet, composed beside the other chip-opened dialogs for the
+    // same reason: it is opened from a chip on the transcript's strip, so a user
+    // who wandered into settings must still see what they asked for.
+    if (state.showGoalTasks) {
+        GoalsTasksDialog(
+            goal = state.goal,
+            todos = state.todos,
+            onDismiss = onCloseGoalTasks,
         )
     }
 
@@ -357,6 +371,7 @@ fun AppShell(
             onOpenPermissionPicker = onOpenPermissionPicker,
             onOpenAgentPresetPicker = onOpenAgentPresetPicker,
             onOpenDeliverables = onOpenDeliverables,
+            onOpenGoalTasks = onOpenGoalTasks,
             onCopyMessage = onCopyMessage,
             // A file chip in the transcript opens it straight into the viewer.
             // There is no listing behind it, which is why `filesOpen` counts an

@@ -208,19 +208,26 @@ check('the transcript wires the long press to the copy action', () => {
 check('one renderer is shared, so both copies agree', () => {
   // A second renderer for single messages would drift from the whole-transcript
   // one, and the drift is only visible when a user pastes the two side by side.
-  // 1.1.9 removed the second *caller*, not the shared renderer: `toMarkdown` stays
-  // as the documented format and `messageMarkdown` is still the only way a copy is
-  // produced.
+  // 1.2.1 changed *which* renderer the copy uses: the export format (role
+  // headings, timestamps, fenced tool JSON) is written for a reader outside the
+  // app, and pasting it elsewhere was reported as 乱码 — scaffolding the user
+  // never saw around the words they did. The copy sheet now carries the plain
+  // bubble text; the export renderer survives as the documented format.
   const body = functionBody(viewModel, 'copyMessage')
   assert.match(
     body,
-    /Transcript\.messageMarkdown\(/,
-    'the single-message copy must reuse the transcript renderer',
+    /Transcript\.messagePlainText\(/,
+    'the single-message copy must use the plain-text renderer',
   )
   assert.match(
     transcriptSrc,
     /fun toMarkdown\(/,
-    'the shared renderer must survive, or the two would drift the moment one returns',
+    'the export renderer must survive, or the two would drift the moment one returns',
+  )
+  assert.match(
+    transcriptSrc,
+    /fun messagePlainText\(/,
+    'the plain-text renderer must live beside the export one, so the two cannot drift silently',
   )
 })
 
@@ -345,51 +352,66 @@ check('opening one reads it through the existing read path', () => {
 console.log('\n=== the turn duration is only shown when provable ===')
 
 check('a merged turn carries the span of its steps', () => {
+  // 1.2.1 changed the measurement to the `turn/start` → `turn/end` wall-clock
+  // pair; the span between the first and last *settlement* timestamps missed the
+  // first model call and the final tool run, and a single-step turn had no span
+  // at all. The boundary pair is the only span that covers the whole turn, and
+  // `turn/end` is written in a `finally`, so every completion path carries one.
   const body = functionBody(sessionParser, 'mergeSteps')
-  assert.match(body, /earliest/, 'the earliest step timestamp must be tracked')
-  assert.match(body, /latest/, 'the latest step timestamp must be tracked')
   assert.match(
     body,
-    /latest\s*-\s*earliest/,
-    'the duration is the span between the first and last step',
+    /durationMs\s*>\s*0L/,
+    'the merged entry must carry a completed boundary measurement, not a recomputed span',
   )
   assert.match(
     body,
     /durationMs\s*=\s*duration/,
     'the computed span must reach the message',
   )
+  const foldBody = functionBody(sessionParser, 'fold')
+  assert.match(
+    foldBody,
+    /turnStarts\[turn\]\s*=\s*time/,
+    'the turn boundary must be recorded from the `turn/start` event time',
+  )
+  assert.match(
+    foldBody,
+    /time\s*-\s*started/,
+    'the duration is the `turn/end` minus `turn/start` wall-clock span',
+  )
 })
 
 check('a step with no timestamp is skipped, not treated as the epoch', () => {
   // A zero `time` means "the log did not say". Counting it would report a duration
   // of roughly 56 years.
-  const body = functionBody(sessionParser, 'mergeSteps')
+  const foldBody = functionBody(sessionParser, 'fold')
   assert.match(
-    body,
-    /if\s*\(t\s*<=\s*0L\)\s*continue/,
-    'timestampless steps must be skipped, or the span becomes ~56 years',
+    foldBody,
+    /time\s*>\s*0L/,
+    'timestampless turn boundaries must be skipped, or the span becomes ~56 years',
   )
   assert.match(
-    body,
-    /earliest\s*!=\s*Long\.MAX_VALUE/,
-    'a group with no usable timestamp must not produce a span',
+    foldBody,
+    /time\s*>\s*started/,
+    'a boundary pair with an end at or before its start must not produce a span',
   )
 })
 
-check('a single-step turn reports no duration rather than zero', () => {
-  // The log records when an event was *written*, not how long the model took. A
-  // one-step turn has no span at all, so showing "用时 0 秒" would assert a
-  // measurement that was never taken.
-  const message = sessionParser.slice(sessionParser.indexOf('val durationMs'))
+check('a single-step turn reports the turn boundary span', () => {
+  // 1.2.1: the old "single-step turns show nothing" rule is gone. A one-step
+  // turn still has a real `turn/start` → `turn/end` pair, so it now reports the
+  // same wall-clock span a five-step turn does; showing nothing for it was the
+  // settlement-span defect, not a virtue.
+  const foldBody = functionBody(sessionParser, 'fold')
   assert.match(
-    message.slice(0, 700),
-    /val durationMs: Long = 0L/,
-    'the default must be zero, meaning "no measurable span"',
+    foldBody,
+    /indexOfLast\s*\{\s*it\.turn\s*==\s*turn\s*&&\s*it\.role\s*==\s*Role\.ASSISTANT\s*\}/,
+    'the completed span must reach the turn\'s final assistant settlement',
   )
   assert.match(
     sessionParser,
-    /only a merged turn has one|Only a merged turn/i,
-    'the reason a lone message reports nothing must be recorded',
+    /Measured only from the matching `turn\/start` and `turn\/end`/,
+    'the reason the measurement uses the boundary pair must be recorded',
   )
 })
 

@@ -12,12 +12,14 @@ import ai.deepseek.dshmobile.data.Block
 import ai.deepseek.dshmobile.data.CallIndex
 import ai.deepseek.dshmobile.data.DshClient
 import ai.deepseek.dshmobile.data.DshClient.SessionAddress
+import ai.deepseek.dshmobile.data.GoalState
 import ai.deepseek.dshmobile.data.LiveAssistant
 import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.PermissionPresets
 import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
+import ai.deepseek.dshmobile.data.TodoItem
 import ai.deepseek.dshmobile.data.TokenUsage
 import ai.deepseek.dshmobile.data.ToolFiles
 import ai.deepseek.dshmobile.data.Transcript
@@ -236,6 +238,24 @@ data class ChatUiState(
     val switchingAgentPreset: Boolean = false,
     /** True while the preset picker is on screen. */
     val showAgentPresetPicker: Boolean = false,
+    // ---- goal & todos -------------------------------------------------------
+    /**
+     * The active session's current goal, from the host's `goal` projection.
+     *
+     * Null when the session has none — which is most sessions — and the entry
+     * chip hides on null rather than offering a sheet with nothing in it.
+     */
+    val goal: GoalState? = null,
+    /**
+     * The active session's todo list, from the host's `todos` projection.
+     *
+     * The host clears it at every `turn/start`, so an empty list is normal
+     * between turns; the sheet renders it as "本回合没有任务清单" rather than
+     * treating it as an error.
+     */
+    val todos: List<TodoItem>? = null,
+    /** True while the goal/todo sheet is on screen. */
+    val showGoalTasks: Boolean = false,
     // ---- workspace files ---------------------------------------------------
     /**
      * The directory listing currently on screen, or null when the browser is shut.
@@ -491,6 +511,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * find it — which renders the same tool twice.
      */
     private val callIndex: CallIndex = mutableMapOf()
+
+    /**
+     * `turn -> the `turn/start` event's write time, for the active session.
+     *
+     * Kept on the view model like [callIndex]: a `turn/end` lands in a later batch
+     * than its `turn/start` whenever the socket re-arms between them, and a
+     * per-batch map would leave that turn without a measurable duration — the
+     * pre-1.2.1 bug of turns quietly showing none.
+     */
+    private val turnStarts: MutableMap<Int, Long> = mutableMapOf()
 
     init {
         _state.value = _state.value.copy(
@@ -839,6 +869,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         controlJob = null
         seenSeqs.clear()
         callIndex.clear()
+        turnStarts.clear()
         projectionSeqs.clear()
         _state.value = _state.value.copy(
             activeSessionId = null,
@@ -1256,6 +1287,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         controlJob?.cancel()
         seenSeqs.clear()
         callIndex.clear()
+        turnStarts.clear()
         projectionSeqs.clear()
         _state.value = _state.value.copy(
             activeSessionId = sessionId,
@@ -1287,6 +1319,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // it is a user preference, not session state.
             activeAgentPreset = "",
             showAgentPresetPicker = false,
+            // The goal and the todo list belong to the session too: they describe
+            // what the previous conversation was doing, and showing them under a
+            // different title would misattribute work.
+            goal = null,
+            todos = null,
+            showGoalTasks = false,
             // The file browser is rooted at the *previous* session's workspace, so
             // its listing describes a directory the new session may not even be
             // able to see. Closing it is the only honest option: keeping it would
@@ -1478,7 +1516,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             }
                             if (fresh.isNotEmpty()) {
                                 val (durable, echoes) = splitEchoes(_state.value.messages)
-                                val folded = SessionParser.fold(fresh, durable, callIndex)
+                                val folded = SessionParser.fold(fresh, durable, callIndex, turnStarts)
                                 // A durable assistant message supersedes the draft.
                                 val superseded =
                                     fresh.any { it.optString("type") == "assistant/message" }
@@ -1633,6 +1671,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                                 // (the host clearing it) is distinguishable from an
                                 // absent key.
                                 values.opt("agentPreset"),
+                                values.opt("goal"),
+                                values.opt("todos"),
                             )
                         }
 
@@ -1658,6 +1698,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                                 // is reserved for "this frame said nothing about the
                                 // mode", which must leave the value alone.
                                 "agentPreset" -> applyProjection(null, null, null, value ?: JSONObject.NULL)
+                                // The goal and todo frames are passed straight through:
+                                // a JSON null means "cleared" (goal finished, turn
+                                // reset the list), an absent key never gets here.
+                                "goal" -> applyProjection(null, null, null, null, value ?: JSONObject.NULL, null)
+                                "todos" -> applyProjection(null, null, null, null, null, value ?: JSONObject.NULL)
                                 else -> applyProjection(null, null, value as? JSONObject, null)
                             }
                         }
@@ -1681,6 +1726,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         contextPressure: JSONObject?,
         permissions: JSONObject?,
         agentPreset: Any? = null,
+        goal: Any? = null,
+        todos: Any? = null,
     ) {
         val current = _state.value
         var next = current
@@ -1707,6 +1754,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         // pre-collapsing nulls.
         if (agentPreset != null) {
             next = next.copy(activeAgentPreset = AgentPresets.presetOf(agentPreset).orEmpty())
+        }
+        // Same contract as the mode for `goal` and `todos`: Kotlin null preserves,
+        // `JSONObject.NULL` clears, a real value replaces. `todos` also collapses a
+        // cleared projection to an empty list rather than null, so the sheet can
+        // tell "this turn has no list" from "the host does not offer the tool".
+        if (goal != null) {
+            next = next.copy(goal = GoalState.currentOf(goal))
+        }
+        if (todos != null) {
+            next = next.copy(todos = TodoItem.listOf(todos).orEmpty())
         }
         if (next !== current) _state.value = next
     }
@@ -1745,6 +1802,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 projectionSeqs["tokenUsage"] = snapshot.asOfSeq
                 projectionSeqs["contextPressure"] = snapshot.asOfSeq
                 projectionSeqs["agentPreset"] = snapshot.asOfSeq
+                projectionSeqs["goal"] = snapshot.asOfSeq
+                projectionSeqs["todos"] = snapshot.asOfSeq
                 _state.value = _state.value.copy(
                     usage = snapshot.total,
                     contextTokens = snapshot.contextTokens,
@@ -1760,6 +1819,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     // mode left on the chip.
                     activeAgentPreset = snapshot.agentPreset
                         ?: _state.value.activeAgentPreset,
+                    // The goal section is authoritative when the response carries
+                    // the key at all; an absent key (host without the projection)
+                    // keeps whatever the live stream already delivered. `todos`
+                    // follows the same rule.
+                    goal = snapshot.goal ?: _state.value.goal,
+                    todos = snapshot.todos ?: _state.value.todos,
                 )
             }
         }
@@ -2944,27 +3009,38 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(showDeliverables = false)
     }
 
+    /** Open the goal/todo sheet. */
+    fun openGoalTasks() {
+        _state.value = _state.value.copy(showGoalTasks = true)
+    }
+
+    /** Close the goal/todo sheet. */
+    fun closeGoalTasks() {
+        _state.value = _state.value.copy(showGoalTasks = false)
+    }
+
     // ------------------------------------------------------------------- copy
 
     /**
      * Copy one message, for the long-press action on a bubble.
      *
-     * This is the *only* copy action now. 1.1.7 put a "复制对话" button in the app
-     * bar and 1.1.8 kept it beside the long press; both were the same mistake in
-     * different sizes. A conversation-long Markdown export is tens of kilobytes on
-     * a real session, it has to be trimmed by hand after pasting, and the thing a
-     * user actually wants is the bubble in front of them. So the app-bar button is
-     * gone and the gesture is the whole feature.
+     * 1.2.1 copies the **plain text of the bubble** — the words the user can see
+     * — rather than the Markdown export. The export format is written for a
+     * reader outside the app (role headings, timestamps, quoted reasoning, fenced
+     * tool JSON), and pasting all of that into a normal input box is what the
+     * 乱码 report describes: characters that were never on screen wrapped around
+     * the words that were.
      *
-     * The Markdown rendering is still shared with [Transcript.toMarkdown], which
-     * the tests use and which documents the one format a copied answer is written
-     * in — one renderer, so a copied bubble and a copied conversation cannot
-     * disagree about how a code block or a tool card is written.
+     * [Transcript.messageMarkdown] stays as the documented export format and the
+     * whole-conversation renderer contract; the copy sheet's selectable body and
+     * 「复制全部」 both carry the plain text now, because "copy what I am reading"
+     * and "export this conversation" are different needs and only the first has
+     * a gesture.
      */
     fun copyMessage(message: Message, onReady: (String) -> Unit) {
         viewModelScope.launch {
             val text = withContext(Dispatchers.Default) {
-                Transcript.messageMarkdown(message).trim()
+                Transcript.messagePlainText(message).trim()
             }
             if (text.isNotBlank()) onReady(text)
         }
@@ -3017,6 +3093,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // per-session state that the host commits with its own event, so the
             // chip has to follow the projection rather than the tap.
             "agentPreset",
+            // 1.2.1: the session's current goal and its todo list. Both are
+            // projection units driven by durable events (`goal/change`, the goal
+            // injection, and `todo/write`), so the live control stream carries
+            // their changes — watching them here is what keeps the sheet current
+            // while a turn works, without a poll.
+            "goal",
+            "todos",
         )
 
         /**

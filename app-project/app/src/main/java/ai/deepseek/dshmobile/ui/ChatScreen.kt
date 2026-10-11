@@ -36,6 +36,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Lock
@@ -154,6 +155,7 @@ fun ChatScreen(
     onOpenPermissionPicker: () -> Unit,
     onOpenAgentPresetPicker: () -> Unit,
     onOpenDeliverables: () -> Unit,
+    onOpenGoalTasks: () -> Unit,
     onCopyMessage: (Message, (String) -> Unit) -> Unit,
     onOpenFile: (String) -> Unit,
 ) {
@@ -377,6 +379,7 @@ fun ChatScreen(
                     onOpenWorkspacePicker = onOpenWorkspacePicker,
                     onOpenPermissionPicker = onOpenPermissionPicker,
                     onOpenAgentPresetPicker = onOpenAgentPresetPicker,
+                    onOpenGoalTasks = onOpenGoalTasks,
                 )
             }
 
@@ -519,6 +522,7 @@ private fun RemoteChipsRow(
     onOpenWorkspacePicker: () -> Unit,
     onOpenPermissionPicker: () -> Unit,
     onOpenAgentPresetPicker: () -> Unit,
+    onOpenGoalTasks: () -> Unit,
 ) {
     val workspace = state.workspaces.firstOrNull { it.id == state.selectedWorkspaceId }
     FlowRow(
@@ -634,6 +638,45 @@ private fun RemoteChipsRow(
                 // explicitly or it sits above its neighbours in landscape.
                 modifier = Modifier.align(Alignment.CenterVertically),
             )
+        }
+        // 1.2.1: what this conversation is trying to do, and the steps it has
+        // promised. Visible only when the host reports either value — a session
+        // with no goal and no todo list would open a sheet with nothing in it,
+        // and a button to an empty room is a dead button.
+        if (state.goal != null || !state.todos.isNullOrEmpty()) {
+            Surface(
+                onClick = onOpenGoalTasks,
+                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier
+                    .align(Alignment.CenterVertically)
+                    .wrapContentHeight(),
+            ) {
+                Row(
+                    Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Default.Flag,
+                        contentDescription = null,
+                        modifier = Modifier.size(10.dp),
+                        tint = MaterialTheme.colorScheme.primary,
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        // A one-word label: the sheet is the content. The running
+                        // todo count is the only number that changes mid-turn, so
+                        // it is the one worth surfacing here.
+                        state.todos?.let { todos ->
+                            val active = todos.count { !it.done }
+                            if (active > 0) "任务 $active" else "目标与任务"
+                        } ?: "目标与任务",
+                        fontSize = 9.5.sp,
+                        maxLines = 1,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
         }
     }
 }
