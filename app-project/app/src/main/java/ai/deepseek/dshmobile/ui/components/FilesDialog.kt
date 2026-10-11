@@ -71,6 +71,7 @@ fun FilesDialog(
     onUp: () -> Unit,
     onCloseFile: () -> Unit,
     onReload: () -> Unit,
+    onBrowse: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     AlertDialog(
@@ -152,7 +153,23 @@ fun FilesDialog(
         },
         confirmButton = {
             if (openFile != null) {
-                TextButton(onClick = onCloseFile) { Text("返回目录", fontSize = 13.sp) }
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    // "浏览工作区": the chip that opened this file named a path, but
+                    // the user may want to see what else is beside it. Without this
+                    // the browser would have no entry point at all now that the app
+                    // bar no longer carries one, and the whole namespace would be
+                    // reachable only through a chip that happens to point near it.
+                    TextButton(onClick = onBrowse) {
+                        Icon(
+                            Icons.Default.Folder,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp),
+                        )
+                        Spacer(Modifier.width(3.dp))
+                        Text("浏览工作区", fontSize = 13.sp)
+                    }
+                    TextButton(onClick = onCloseFile) { Text("返回目录", fontSize = 13.sp) }
+                }
             } else {
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     if (canGoUp) {

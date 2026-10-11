@@ -49,9 +49,9 @@ const appShell = src('ui/AppShell.kt')
 const chatScreen = src('ui/ChatScreen.kt')
 const sessionTree = src('ui/SessionTree.kt')
 const messageBubble = src('ui/components/MessageBubble.kt')
-const transcriptFilesDialog = src('ui/components/TranscriptFilesDialog.kt')
 const sessionParser = src('data/SessionParser.kt')
 const toolFiles = src('data/ToolFiles.kt')
+const transcriptSrc = src('data/Transcript.kt')
 const mainActivity = src('MainActivity.kt')
 const changelog = read('CHANGELOG.md')
 const ci = read('.github/workflows/ci.yml')
@@ -178,27 +178,38 @@ check('the transcript wires the long press to the clipboard', () => {
 check('one renderer is shared, so both copies agree', () => {
   // A second renderer for single messages would drift from the whole-transcript
   // one, and the drift is only visible when a user pastes the two side by side.
+  // 1.1.9 removed the second *caller*, not the shared renderer: `toMarkdown` stays
+  // as the documented format and `messageMarkdown` is still the only way a copy is
+  // produced.
   const body = functionBody(viewModel, 'copyMessage')
   assert.match(
     body,
     /Transcript\.messageMarkdown\(/,
     'the single-message copy must reuse the transcript renderer',
   )
-  const whole = functionBody(viewModel, 'copyTranscript')
   assert.match(
-    whole,
-    /Transcript\.toMarkdown\(/,
-    'the whole-transcript copy must keep using the same renderer family',
+    transcriptSrc,
+    /fun toMarkdown\(/,
+    'the shared renderer must survive, or the two would drift the moment one returns',
   )
 })
 
-check('the whole-transcript copy is kept as well', () => {
-  // They are different needs — "take this conversation with me" versus "copy the
-  // thing I am reading" — so fixing one must not remove the other.
-  assert.match(
+check('the whole-transcript copy was later removed by 1.1.9', () => {
+  // 1.1.8 kept the app-bar export beside the long press, reasoning that "take this
+  // conversation with me" and "copy the thing I am reading" are different needs.
+  // 1.1.9 disagreed, and the reasoning is recorded here because this is where the
+  // earlier decision lived: the export is tens of kilobytes on a real session, it
+  // has to be trimmed by hand after pasting, and the app bar is the scarcest space
+  // on the screen. The long press is the whole feature now.
+  assert.doesNotMatch(
     chatScreen,
     /onCopyTranscript/,
-    'the app-bar whole-conversation copy must survive the long-press addition',
+    'the app-bar whole-conversation copy was removed in 1.1.9',
+  )
+  assert.doesNotMatch(
+    viewModel,
+    /fun copyTranscript/,
+    'and its view-model action was deleted with it, not left unwired',
   )
 })
 
@@ -255,60 +266,38 @@ check('the list is newest first and de-duplicated', () => {
   assert.match(body, /asReversed\(\)/, 'the result must be reversed to newest-first')
 })
 
-check('the list is derived from the transcript, not snapshotted', () => {
-  // The transcript grows one batch at a time. A stored copy would freeze at the
-  // moment it was opened and leave the button's own visibility a turn behind —
-  // the exact shape of bug this release fixes elsewhere.
-  const stateBlock = viewModel.slice(0, viewModel.indexOf('class ChatViewModel'))
+check('the per-tool reader is what the inline chips are built from', () => {
+  // 1.1.9 replaced the separate list with chips on the tool card, but the reader
+  // that answers "which argument holds the path" is the same one — a second
+  // implementation is how the two would drift about what `present` names.
   assert.match(
-    stateBlock,
-    /val transcriptFiles:[\s\S]{0,120}get\(\)\s*=\s*ToolFiles\.ofTranscript\(messages\)/,
-    'transcriptFiles must be a computed property over the live transcript',
+    messageBubble,
+    /ToolFiles\.of\(block\.name,\s*block\.input\)/,
+    'the chips must come from the shared per-tool reader',
   )
-  assert.match(
-    stateBlock,
-    /val showTranscriptFiles: Boolean/,
-    'visibility must be a separate flag rather than the list itself',
-  )
-})
-
-check('opening it does not trip the workspace browser', () => {
-  // `filesOpen` is defined as "the browser has a listing or an error", so writing
-  // an error here would pop the *browser* open behind this dialog.
-  const body = functionBody(viewModel, 'openTranscriptFiles')
-  assert.doesNotMatch(
-    stripLineComments(body),
-    /filesError\s*=/,
-    'the assistant-files action must not write the workspace browser\'s error field',
-  )
-  assert.match(body, /showTranscriptFiles\s*=\s*true/, 'it must open its own dialog')
 })
 
 check('the full path is shown, not a shortened tail', () => {
-  // In a one-line tool card the tail is right, because the card shares a line. Here
-  // the path is the only content, and two files named `index.ts` are a real
-  // possibility — an ambiguous list is worse than a long one.
+  // 1.1.8's dialog showed the whole path because it was the only content on its
+  // row and two files named `index.ts` had to be told apart. 1.1.9's chip shows
+  // the tail — it lives inside a card that already names the tool and its target,
+  // is one line wide, and is not the only way to reach the file — but the full
+  // path stays reachable through the content description, which is what keeps the
+  // chip unambiguous. Both halves of that decision are asserted here so neither
+  // can be dropped on its own.
+  const chip = functionLine(toolFiles, 'chipName')
+  assert.match(chip, /substringAfterLast\('\/'\)/, 'the chip shows the file name')
   assert.match(
-    transcriptFilesDialog,
-    /ref\.path/,
-    'the row must render the path',
-  )
-  assert.match(
-    transcriptFilesDialog,
-    /FontFamily\.Monospace/,
-    'the path must be monospaced so it reads as a path',
-  )
-  assert.doesNotMatch(
-    stripLineComments(functionBody(transcriptFilesDialog, 'FileRefRow')),
-    /takeLast|tailPath|shorten/,
-    'the path must not be truncated to its tail here',
+    messageBubble,
+    /contentDescription = ref\.path/,
+    'and the full path is still exposed, so the chip cannot be ambiguous',
   )
 })
 
 check('opening one reads it through the existing read path', () => {
   // No second reader: the workspace-files read call already handles absolute and
   // relative paths and already enforces the workspace boundary.
-  const shell = appShell.slice(appShell.indexOf('TranscriptFilesDialog('))
+  const shell = appShell.slice(appShell.indexOf('onOpenFile'))
   assert.match(
     shell.slice(0, 500),
     /onOpenWorkspaceFile/,
@@ -728,18 +717,30 @@ check('the drawer is wired end to end', () => {
   )
   assert.match(
     mainActivity,
-    /onOpenTranscriptFiles\s*=\s*vm::openTranscriptFiles/,
-    'the activity must connect the assistant-files action',
+    /onOpenPermissionPicker\s*=\s*vm::openPermissionPicker/,
+    'the activity must connect the permission picker added in 1.1.9',
   )
 })
 
-check('the entry point is only offered when it has something to show', () => {
-  // An action that leads to an empty list is worse than an absent one: it costs a
-  // tap and teaches the user that the feature does not work.
-  assert.match(
+check('the app bar carries neither the copy nor the file button', () => {
+  // 1.1.8 put the assistant-files list behind an app-bar button, gated on the list
+  // being non-empty so it never led nowhere. 1.1.9 removed the button along with
+  // the list: the files are chips on the tool card that named them, so there is no
+  // entry point left to gate.
+  assert.doesNotMatch(
     chatScreen,
-    /state\.transcriptFiles\.isNotEmpty\(\)[\s\S]{0,300}onOpenTranscriptFiles/,
-    'the assistant-files button must be gated on the list being non-empty',
+    /onOpenTranscriptFiles/,
+    'the assistant-files button was removed in 1.1.9',
+  )
+  assert.doesNotMatch(
+    chatScreen,
+    /onOpenFiles/,
+    'and so was the workspace-browser button',
+  )
+  assert.doesNotMatch(
+    chatScreen,
+    /onCopyTranscript/,
+    'and the whole-conversation copy',
   )
 })
 
@@ -808,10 +809,16 @@ check('the new sources are real files', () => {
   for (const rel of [
     'app-project/app/src/main/java/ai/deepseek/dshmobile/data/ToolFiles.kt',
     'app-project/app/src/main/java/ai/deepseek/dshmobile/ui/SessionTree.kt',
-    'app-project/app/src/main/java/ai/deepseek/dshmobile/ui/components/TranscriptFilesDialog.kt',
   ]) {
     assert.ok(exists(rel), `${rel} is missing`)
   }
+  // `TranscriptFilesDialog.kt` was 1.1.8's separate list. 1.1.9 deleted it, and the
+  // suite asserts the deletion rather than the file, because a stale entry here
+  // would fail on a tree that is correctly newer.
+  assert.ok(
+    !exists('app-project/app/src/main/java/ai/deepseek/dshmobile/ui/components/TranscriptFilesDialog.kt'),
+    'the separate file list was replaced by inline chips in 1.1.9',
+  )
 })
 
 check('1.1.7\'s own suite still describes the code it guards', () => {

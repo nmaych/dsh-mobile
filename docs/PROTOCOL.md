@@ -488,6 +488,111 @@ Cookie: <会话Cookie>
 
 上限：单页 5000 行、单次列举 2000 项、文本读取 2 MiB、整文件 32 MiB。
 
+### `permissionPresets`：权限模式（1.1.9 起）
+
+命名空间 `permissionPresets` 只有**一个**方法：`catalog`。它**没有任何参数**，
+所以 `args` 必须是 `{}`——多一个键就是 `gateway/arguments-invalid`。
+
+```json
+{ "options": [ { "value": "workspace-write", "name": "workspace-write",
+                 "description": "…" },
+               { "value": "danger-full-access", "name": "danger-full-access",
+                 "description": "…" } ],
+  "defaultOptions": [ … ],
+  "defaultPreset": "workspace-write" }
+```
+
+- `options` 是**可以选的**集合，`defaultOptions` 是**新建会话可以用的**集合
+  （设置页关心的事，本应用不用）。
+- 两个内置模式是 `workspace-write`（沙箱写 + `ask` 审批）和 `danger-full-access`
+  （全权 + `never`）。但**部署可以配自己的表**，`auto` 只在装了那个实验性审查
+  应答者时才存在——所以**不要硬编码**这两个名字。
+- `description` 是安全相关的说明，原文照登。
+
+#### 当前值在 `permissions` 投影里，不在这个调用里
+
+目录是**部署级**的，当前模式是**会话级**的：
+
+```json
+// session/projections → values
+{ "permissions": { "currentValue": "workspace-write" } }
+```
+
+它和 `tokenUsage`、`contextPressure` 并排放在同一个 `values` 对象里，所以
+**一次调用读三个**，而且同一条 `session/control` 流会实时推送它的变化。
+
+#### 写操作是 `/permission <preset>` 命令，不是 RPC
+
+`permissionPresets` **只暴露读**。切换走的是插件自己注册的斜杠命令，
+经 `commands/execute` 派发：
+
+```json
+// POST /api/commands/execute  →  args
+{ "agentId": "session-…", "line": "/permission workspace-write",
+  "submittedAttachments": [] }
+```
+
+三处形状是硬的：
+
+1. **`agentId` 是查找字段**，不是请求体里的值。`commands/execute` 是 agent 作用域的，
+   会话 id 走 `agentId`。
+2. **`submittedAttachments` 不能省**。描述符里它没有 `acceptsUndefined`，所以缺这个键
+   是 `gateway/arguments-invalid`；发空数组（桌面端发普通调用时也是这么发的）。
+3. **返回值可能是 `undefined`**，表示这一行没解析到任何命令（名字不对或语法不对）。
+   那是一个**必须报告**的失败，而不是「切换成功」。
+
+结果里 `result.kind` 为 `error` 时 `result.text` 是拒绝的原因。
+
+### `approval/request`：在手机上授权（1.1.9 起）
+
+和 `user-questions/request` 走**同一条** `$events` 流、**同一个** `waterfall` 帧形状、
+**同一个** `$events/result` 回答通道。区别只有两处：帧里的 `event` 名字，和答案的**形状**。
+
+```json
+// $events 的 item
+{ "type": "waterfall", "event": "approval/request", "eventId": "…",
+  "agentId": "session-…",
+  "request": { "toolName": "pwsh", "callId": "…", "reason": "…",
+               "displayReason": { "en": "…", "zh": "…" } } }
+```
+
+- `displayReason` 是**请求方自己提供的展示文案**，按 locale 索引，`en` 必有。
+  它优先于 `reason`：`reason` 是审计记录，不是写给手机屏幕看的。
+- `request` 里**不会有 `agent` 和 `signal`**：网关在转发时会把它们剥掉（它们是活对象，
+  不是 JSON）。
+
+#### 答案是**裸字符串**，不是对象
+
+这是和回答提问**唯一实质性的差别**。宿主监听器直接返回
+`'allowed-once' | 'rejected'`，网关转发的是监听器产出的那个 JSON 值：
+
+```json
+// POST /api/$events/result  →  args
+{ "clientId": "…", "eventId": "…", "outcome": { "kind": "result",
+                                                "value": "allowed-once" } }
+```
+
+对比提问那边 `value` 是一个对象（`{"answers":[…]}`）。所以客户端的
+`answerForwardedEvent` 收 `Any?` 而不是 `JSONObject`。
+
+线上的完整取值是 `allowed-once | rejected | cancelled | unavailable`，但**只有前两个是
+决定**：`cancelled` 是请求自己的 signal 中止了，`unavailable` 是没有应答者认领。
+后两个不是按钮该发的东西。
+
+#### 「稍后」不是「拒绝」
+
+`ctx.approval` 的默认策略是 `ask`，而整条 seam **失败即拒绝**：没有应答者、或者应答者
+报错，请求解析成 `unavailable`，操作被**拒绝**。
+
+所以很容易把「稍后」当成拒绝，但那是错的——「稍后」只在这个客户端把提示收起来，
+宿主的 waterfall **照旧挂着**，桌面端自己的应答者仍然可以决定。发 `rejected` 是手机替
+一个它从未被要求做的决定做主。
+
+#### 两种请求共用 `cancel`，id 空间是分开的
+
+`{"type":"cancel","eventId":"…"}` 对两种 waterfall 都发。所以收到 cancel 要**两个队列
+都过滤**：只查提问队列会让一个已经被桌面端结清的授权请求留在屏幕上。
+
 ### token 显示口径（与桌面端一致，1.1.6 起）
 
 手机此前自创了一套显示（`↑209k (10.3M 缓存) ↓309k`，小写 `k`，箭头），
@@ -661,6 +766,36 @@ session/agent-busy: subagent Sessions require their durable parent address
 `assistant/attempt` 是**失败/取消的尝试**，不含 `message`，**不能**当成回复渲染。
 
 思考内容没有独立事件类型，它是 `assistant/message` 里 `type:"reasoning"` 的块。
+
+### `user/message` 有两类：真人发的，和 Harness 自己注入的（1.1.9 起）
+
+**Harness 写给模型看的注入材料也是 `user/message`**——因为那就是模型该读到它们的
+角色。所以**只看 `role` 分不出来**，把注入内容渲染成用户气泡，就是 1.1.9 修的那个
+「对话显示异常」：用户自己的消息后面跟着两条他从没写过的蓝气泡。
+
+能分清的是 **`data.source.kind`**（桌面端自己的渲染器用的也是这个字段）：
+
+| `source.kind` | 是什么 |
+|---|---|
+| `user` | 真人发的。`user-rpc` 也归到这一类（它保留 `kind: 'user'`，另带 `rpcId`） |
+| `runtime-context` | 逐步的运行时上下文快照：沙箱策略、审批策略、委派范围、cwd |
+| `skill-catalog` | `<available_skills>` 目录，以及后续的**完整替换** |
+| `skill-invocation` | `/名字` 手势注入的 `<skill_content>` |
+| `agent-instructions`、`session-reference`、`goal`、`plan-mode`、`time-context`、`tmux-context`、`repeat-tool-reminder`、`model-selection`、`coordinator`、`team-message`、`agent-message`、`subagent-report`、`subagent-settled`、`webhook`、`compact-checkpoint`、`compact-basic`、`ptc-mode`、`tool-registry` | 同一张表里的其余生产者，全部是注入 |
+| `plugin:<原始插件名>` | **未识别插件**注入的材料 |
+
+注意 `user/message` 的 payload **就是消息本身**（`data.content`、`data.source`），
+不像其它带消息的事件那样嵌在 `data.message` 里。
+
+分类用**白名单**：认不出来的 kind 当成**真消息**。反过来（认不出来就当注入）会把用户
+自己发的话藏进「上下文」里，那比漏判更糟。
+
+#### 注入内容不能顶掉本地回声
+
+发消息时会先在本地画一条（id 前缀 `local-`），等服务端的 `user/message` 落地再撤掉。
+撤回的规则是「**一条**已提交消息撤**一条**回声」，所以一次注入快照会被当成「已提交的
+提示」，把用户刚发出去那条的乐观渲染吃掉——消息会凭空消失到它自己的事件到达为止。
+所以取「已提交提示文本」的那一步（`userTextOf`）对注入内容**返回 null**。
 
 ### 一轮 = 多条 `assistant/message`（1.1.4 起用于合并显示）
 

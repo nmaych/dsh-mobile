@@ -17,11 +17,13 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material3.Icon
@@ -44,6 +46,7 @@ import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Block
 import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.Role
+import ai.deepseek.dshmobile.data.ToolFiles
 import ai.deepseek.dshmobile.data.ToolLabel
 
 @Composable
@@ -58,10 +61,18 @@ fun MessageBubble(
      * offering "复制" for it would promise something the user did not ask for.
      */
     onCopy: (() -> Unit)? = null,
+    /**
+     * Opens one file a tool call named, or null to render the chip as plain text.
+     *
+     * Nullable for the same reason [onCopy] is: API mode has no workspace to read
+     * from, so a chip there would be a button that cannot work.
+     */
+    onOpenFile: ((String) -> Unit)? = null,
 ) {
     when (message.role) {
         Role.USER -> UserBubble(message, modifier, onCopy)
-        Role.ASSISTANT -> AssistantBubble(message, modifier, onCopy)
+        Role.ASSISTANT -> AssistantBubble(message, modifier, onCopy, onOpenFile)
+        Role.CONTEXT -> ContextBubble(message, modifier, onCopy)
         Role.SYSTEM, Role.TOOL -> SystemBubble(message, modifier)
     }
 }
@@ -124,7 +135,12 @@ private fun UserBubble(message: Message, modifier: Modifier, onCopy: (() -> Unit
 }
 
 @Composable
-private fun AssistantBubble(message: Message, modifier: Modifier, onCopy: (() -> Unit)?) {
+private fun AssistantBubble(
+    message: Message,
+    modifier: Modifier,
+    onCopy: (() -> Unit)?,
+    onOpenFile: ((String) -> Unit)?,
+) {
     Row(modifier = modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Box(
             Modifier
@@ -153,7 +169,7 @@ private fun AssistantBubble(message: Message, modifier: Modifier, onCopy: (() ->
                 when (block) {
                     is Block.Text -> Markdown(block.text)
                     is Block.Reasoning -> ReasoningBlock(block)
-                    is Block.ToolCall -> ToolCallBlock(block)
+                    is Block.ToolCall -> ToolCallBlock(block, onOpenFile)
                     is Block.Notice -> Text(
                         block.text,
                         color = if (block.isError) MaterialTheme.colorScheme.error
@@ -257,6 +273,106 @@ private fun SystemBubble(message: Message, modifier: Modifier) {
 }
 
 /**
+ * Harness-injected context: the runtime-context snapshot, the skill catalog.
+ *
+ * ## Why this is not a user bubble
+ *
+ * These arrive as `user/message` events — that is the role the model reads them in
+ * — so before the parser distinguished them they rendered exactly like something
+ * the user had typed: same blue, same right alignment, same size. The reported
+ * anomaly was precisely that: a prompt followed by two more blue bubbles the user
+ * never wrote, one of them a wall of sandbox and approval boilerplate.
+ *
+ * ## Why it is still shown
+ *
+ * Hiding it would make the transcript disagree with the log, and the material is
+ * genuinely part of what the model was told — a user debugging "why did it think
+ * it could not write there?" needs to see the policy it was given. So it is shown
+ * but demoted: collapsed by default, full width, neutral chrome, and labelled so
+ * it cannot be mistaken for speech. The collapsed row is the whole fix — the
+ * content is one tap away and no longer impersonates the user.
+ *
+ * The gesture is still offered, because copying the policy the model saw is a
+ * legitimate thing to want.
+ */
+@Composable
+private fun ContextBubble(message: Message, modifier: Modifier, onCopy: (() -> Unit)?) {
+    var expanded by remember { mutableStateOf(false) }
+    val text = message.blocks.filterIsInstance<Block.Text>().joinToString("\n\n") { it.text }
+    if (text.isBlank()) return
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 3.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+            .longPressCopy(enabled = true, onCopy = onCopy)
+            .clickable { expanded = !expanded }
+            .padding(horizontal = 9.dp, vertical = 7.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Info,
+                contentDescription = null,
+                modifier = Modifier.size(13.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(5.dp))
+            Text(
+                contextLabel(text),
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Icon(
+                if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = if (expanded) "收起" else "展开",
+                modifier = Modifier.size(15.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        AnimatedVisibility(visible = expanded) {
+            Text(
+                text,
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 5.dp),
+            )
+        }
+    }
+}
+
+/**
+ * A short name for one injected block, taken from the block itself.
+ *
+ * The source kind would be the precise label, but it is not carried into the
+ * transcript — and a generic "上下文" would be wrong for the one case a user is
+ * most likely to meet. The two producers this app actually sees both announce
+ * themselves in their first line, so the label is read from there and falls back
+ * to a plain name when it does not match.
+ *
+ * Recognising by *content* is deliberate here rather than by source: the content
+ * is what the user is looking at, so the label cannot disagree with the body.
+ */
+internal fun contextLabel(text: String): String {
+    val head = text.trimStart().take(200)
+    return when {
+        head.startsWith("<system-reminder>") && head.contains("available_skills") ->
+            "技能列表"
+        head.startsWith("<system-reminder>") -> "系统提示"
+        head.startsWith("Current runtime context") ||
+            head.startsWith("Current DSH file policy") -> "运行环境"
+        else -> "上下文"
+    }
+}
+
+/**
  * Collapsible "thinking" section.
  *
  * [Block.Reasoning.parts] counts how many separate reasoning blocks were folded
@@ -312,7 +428,7 @@ private fun ReasoningBlock(block: Block.Reasoning) {
 }
 
 /**
- * One step of a turn: what the assistant did, in words.
+ * One step of a turn: what the assistant did, in words, and the files it touched.
  *
  * The header used to be the tool's identifier — `pwsh`, `read`, `edit` — in
  * monospace. That named the mechanism and hid the act: a user could see that
@@ -324,9 +440,22 @@ private fun ReasoningBlock(block: Block.Reasoning) {
  * A step that has not reported back yet is marked as running. That distinction
  * was previously invisible, and it is the one thing a user watching a long turn
  * actually wants to know.
+ *
+ * ## Why the files are chips on the card
+ *
+ * 1.1.7 answered "what did it just make?" with a separate dialog behind an app-bar
+ * button, and that was one step too many: the path is already *in* the call being
+ * rendered, so a list that had to be opened elsewhere was a second copy of a fact
+ * the card was already showing. Worse, it was a snapshot of the whole
+ * conversation — the file the user wanted was at the top of a list that also held
+ * everything from an hour ago. Now the file is a chip on the very step that named
+ * it, in the place the user is already reading, and one tap opens it. The chips
+ * are derived from the call's own arguments by [ToolFiles], which is the same
+ * per-tool reader the dialog used, so `present`'s file list and `read`'s
+ * `file_path` are still understood by name rather than guessed at.
  */
 @Composable
-private fun ToolCallBlock(block: Block.ToolCall) {
+private fun ToolCallBlock(block: Block.ToolCall, onOpenFile: ((String) -> Unit)?) {
     var expanded by remember { mutableStateOf(false) }
     val running = block.output == null && !block.failed
     val accent = when {
@@ -334,6 +463,9 @@ private fun ToolCallBlock(block: Block.ToolCall) {
         running -> MaterialTheme.colorScheme.onSurfaceVariant
         else -> MaterialTheme.colorScheme.primary
     }
+    // Read from the call's own arguments, so a tool this build does not know
+    // simply yields nothing rather than offering to open a shell command.
+    val files = remember(block.name, block.input) { ToolFiles.of(block.name, block.input) }
     Column(
         Modifier
             .fillMaxWidth()
@@ -373,6 +505,15 @@ private fun ToolCallBlock(block: Block.ToolCall) {
                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        // The chips sit outside the collapse: they are the answer to "what did it
+        // just make", and hiding the thing the card exists to surface behind a
+        // second tap would put the friction straight back.
+        if (files.isNotEmpty()) {
+            Spacer(Modifier.height(5.dp))
+            for (ref in files) {
+                FileChip(ref = ref, onOpen = onOpenFile)
+            }
+        }
         AnimatedVisibility(visible = expanded) {
             Column(Modifier.padding(top = 5.dp)) {
                 Text(
@@ -401,6 +542,64 @@ private fun ToolCallBlock(block: Block.ToolCall) {
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * One file a tool call named, as a tappable chip.
+ *
+ * The chip shows the file's tail rather than its full path — see
+ * [ToolFiles.chipName] for why that is the opposite choice from the dialog it
+ * replaces — and carries the full path in its content description, so a screen
+ * reader and a long-press both still reach the unambiguous form.
+ *
+ * When [onOpen] is null (API mode, where there is no workspace to read from) the
+ * chip still renders, because the *fact* that a file was involved is worth
+ * knowing, but it is not clickable: a button that cannot work is worse than a
+ * label that does not pretend.
+ */
+@Composable
+private fun FileChip(ref: ToolFiles.Ref, onOpen: ((String) -> Unit)?) {
+    val name = ToolFiles.chipName(ref.path)
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 1.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f))
+            .then(
+                if (onOpen == null) Modifier
+                // `clickable` on the chip, not on the card: the card's own tap
+                // toggles the detail, so without stopping here a chip tap would do
+                // both.
+                else Modifier.clickable { onOpen(ref.path) }
+            )
+            .padding(horizontal = 7.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.AutoMirrored.Filled.InsertDriveFile,
+            contentDescription = ref.path,
+            modifier = Modifier.size(12.dp),
+            tint = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(Modifier.width(5.dp))
+        Text(
+            name,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace,
+            color = MaterialTheme.colorScheme.primary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (onOpen != null) {
+            Text(
+                "打开",
+                fontSize = 10.sp,
+                color = MaterialTheme.colorScheme.primary,
+            )
         }
     }
 }

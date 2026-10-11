@@ -117,6 +117,19 @@ jobs:
       - name: Test 1.1.8 regressions
         run: node test/regression-1.1.8.test.mjs
 
+      # Guards the 1.1.9 changes. Two of them remove what 1.1.8 left behind — the
+      # app-bar copy button and the separate "files the assistant used" list, both
+      # of which are now the long press and an inline chip — and two are new. The
+      # fix is the reported transcript anomaly: the Harness writes its own injected
+      # material (the runtime-context snapshot, the skill catalog) as `user/message`
+      # events, so it rendered as the user's own words. The source kind is what
+      # tells them apart, and the classification is diff-tested against a pinned
+      # table. The new capabilities are a permission-mode switch and answering
+      # approvals, whose outcome is a bare wire string on the same forwarded-event
+      # waterfall as ask_user_question.
+      - name: Test 1.1.9 regressions
+        run: node test/regression-1.1.9.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

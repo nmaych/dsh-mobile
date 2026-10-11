@@ -56,6 +56,9 @@ object ToolFiles {
      * Newest first because the reason to open this list is almost always "the
      * thing it just made". De-duplicated by path, keeping the newest mention's
      * description, so a file written and then edited appears once.
+     *
+     * Kept even though the transcript now renders these inline: this is the
+     * order-and-dedupe rule, and it is what the inline chips are built from.
      */
     fun ofTranscript(messages: List<Message>): List<Ref> {
         val seen = LinkedHashMap<String, Ref>()
@@ -72,6 +75,23 @@ object ToolFiles {
         }
         return seen.values.toList().asReversed()
     }
+
+    /**
+     * The name to put on a chip, shortened to its tail.
+     *
+     * The opposite choice from the old dialog, and deliberately so. There the path
+     * was the only content on its row and two files named `index.ts` had to be
+     * told apart, so it was shown in full. A chip sits inside a tool card that
+     * already names the tool and its target, is one line wide on a phone, and is
+     * *not* the only way to reach the file — so the tail is what identifies it and
+     * the full path stays available by opening it. A full Windows path on a chip
+     * would push everything else off the row.
+     *
+     * Handles both separators, because the desktop writes `\` and a model writing
+     * a relative path may use `/`.
+     */
+    fun chipName(path: String): String =
+        path.replace('\\', '/').trimEnd('/').substringAfterLast('/').ifBlank { path }
 
     /** The argument object, tolerating the nested shape [ToolLabel] documents. */
     private fun argumentsOf(arguments: String): JSONObject {

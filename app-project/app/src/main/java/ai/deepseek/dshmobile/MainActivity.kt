@@ -229,6 +229,7 @@ private fun DshRoot(
             }
         },
         onAnswerQuestion = vm::answerQuestion,
+        onAnswerApproval = vm::answerApproval,
         onOpenFiles = { vm.openFiles() },
         onOpenFilesChild = vm::openFilesChild,
         // The dialog names an entry by its *name*, because that is all the wire
@@ -242,10 +243,11 @@ private fun DshRoot(
         onFilesUp = vm::openFilesParent,
         onFilesReload = { vm.openFiles(vm.state.value.filesPath) },
         onCloseFiles = vm::closeFiles,
-        onCopyTranscript = vm::copyTranscript,
         onCopyMessage = vm::copyMessage,
-        onOpenTranscriptFiles = vm::openTranscriptFiles,
-        onCloseTranscriptFiles = vm::closeTranscriptFiles,
+        onOpenPermissionPicker = vm::openPermissionPicker,
+        onPickPermission = vm::selectPermissionPreset,
+        onReloadPermissionPresets = vm::reloadPermissionPresets,
+        onClosePermissionPicker = vm::closePermissionPicker,
         onToggleGroup = vm::toggleGroup,
     )
 }

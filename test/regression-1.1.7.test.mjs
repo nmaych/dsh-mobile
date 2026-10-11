@@ -500,21 +500,26 @@ check('a message with nothing to render is skipped, not left as a bare heading',
 })
 
 check('the copy action is reachable and renders off the main thread', () => {
-  assert.match(
-    chatScreen,
-    /onCopyTranscript/,
-    'the transcript screen must offer the copy action',
-  )
+  // 1.1.7 shipped the whole-transcript export behind an app-bar button. 1.1.8
+  // corrected the *gesture* — a long press on one message — while keeping the
+  // button, and 1.1.9 removed the button. What survives from this release is the
+  // requirement that rendering happens off the main thread: building a message's
+  // Markdown is still large enough to drop frames during the tap that asked for it.
   assert.match(
     chatScreen,
     /LocalClipboardManager/,
     'the text must be placed on the real clipboard',
   )
-  const body = functionBody(viewModel, 'copyTranscript')
+  const body = functionBody(viewModel, 'copyMessage')
   assert.match(
     body,
     /withContext\(Dispatchers\.Default\)/,
-    'a long transcript must be rendered off the main thread, or the tap drops frames',
+    'the render must happen off the main thread, or the tap drops frames',
+  )
+  assert.doesNotMatch(
+    chatScreen,
+    /onCopyTranscript/,
+    'the app-bar whole-conversation button was removed in 1.1.9',
   )
 })
 
@@ -598,17 +603,26 @@ check('a truncated listing says so', () => {
 
 check('the file browser is reachable and rooted at a session', () => {
   assert.match(appShell, /FilesDialog\(/, 'the shell must host the file browser')
+  // 1.1.7 offered it from the transcript's app bar. 1.1.9 removed that button, so
+  // the entry point moved inside the dialog itself — a file opened from a chip
+  // offers "浏览工作区". The requirement that survives is that the browser is
+  // reachable at all, and that it is still rooted at a session.
   assert.match(
-    chatScreen,
-    /onOpenFiles/,
-    'the transcript screen must offer the file browser',
+    appShell,
+    /onBrowse = onOpenFiles/,
+    'the browser must still be reachable; 1.1.9 moved its entry point into the file dialog',
+  )
+  assert.match(
+    filesDialog,
+    /onBrowse/,
+    'the file view must offer the workspace browser',
   )
   // With no session there is no workspace root to browse, so the entry point is
   // gated on one rather than opening onto a guessed directory.
   assert.match(
-    chatScreen,
-    /state\.activeSessionId != null[\s\S]{0,200}onOpenFiles/,
-    'the browser is rooted at a session, so it must only be offered with one',
+    functionBody(viewModel, 'openFiles'),
+    /activeSessionId \?: run[\s\S]{0,600}filesError/,
+    'the browser is rooted at a session, so it must report rather than guess without one',
   )
   assert.match(
     viewModel,

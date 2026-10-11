@@ -3,8 +3,20 @@ package ai.deepseek.dshmobile.data
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Who produced a transcript entry. */
-enum class Role { USER, ASSISTANT, SYSTEM, TOOL }
+/**
+ * Who produced a transcript entry.
+ *
+ * [CONTEXT] is the one that is not a speaker. The Harness writes its own
+ * injected, model-facing material — the per-step runtime-context snapshot, the
+ * skill catalog — as `user/message` events, because that is the role the model
+ * is meant to read them in. Rendering them as [USER] therefore claimed the user
+ * had typed them: the reported anomaly was the user's own prompt followed by two
+ * more blue bubbles ("Current runtime context…", "<system-reminder>…") that the
+ * user never wrote. They are still shown — they are real conversation history
+ * and hiding them would make the transcript disagree with the log — but under
+ * their own role, in their own collapsed chrome.
+ */
+enum class Role { USER, ASSISTANT, SYSTEM, TOOL, CONTEXT }
 
 /** One rendered block inside a message. */
 sealed interface Block {
@@ -304,9 +316,16 @@ object SessionParser {
                     if (!isAppend(surfaceOp)) continue
                     val text = textOf(data.optJSONArray("content"))
                     if (text.isNotBlank()) {
+                        // Injected context is written as a `user/message` because
+                        // that is the role the model reads it in, so the role alone
+                        // cannot tell it from a real prompt — the `source.kind`
+                        // does. Rendering these as the user's own words is the
+                        // reported anomaly: the user's prompt followed by two more
+                        // blue bubbles they never typed.
+                        val injected = isInjectedContext(data.optJSONObject("source"))
                         out += Message(
                             id = data.optString("id").ifBlank { "u-$seq" },
-                            role = Role.USER,
+                            role = if (injected) Role.CONTEXT else Role.USER,
                             blocks = listOf(Block.Text(text)),
                             time = time,
                         )
@@ -440,6 +459,92 @@ object SessionParser {
 
     /** Only `"append"` surface operations are conversation. */
     private fun isAppend(surfaceOp: Any?): Boolean = surfaceOp is String && surfaceOp == "append"
+
+    // ---------------------------------------------------- injected context
+
+    /**
+     * The `source.kind` values that mean "the Harness injected this", not "a human
+     * typed this".
+     *
+     * Every one of these arrives as a `user/message` — that is the role the model
+     * is supposed to read the material in — so the role alone cannot tell them
+     * apart from a real prompt. The `source.kind` can, and it is the field the
+     * desktop's own renderer uses for exactly this distinction.
+     *
+     * The list is deliberately an allowlist of kinds that are *known* to be
+     * injected, and an unknown kind is treated as a real user message. That is the
+     * safe direction: showing a user's own prompt under the context chrome would
+     * hide what they said, which is worse than the reverse. It is also what keeps
+     * a future plugin's `plugin:<name>` source from silently swallowing a prompt.
+     *
+     * The names come from the V4 session format's source table:
+     *
+     *  - `runtime-context` — the per-step snapshot (sandbox policy, approval
+     *    policy, delegation scope, cwd). This is the one in the report.
+     *  - `skill-catalog` — the `<available_skills>` block, and its later
+     *    complete replacements.
+     *  - `agent-instructions`, `session-reference`, `goal`, `plan-mode`,
+     *    `time-context`, `tmux-context`, `repeat-tool-reminder`, `hooks-codex`,
+     *    `hooks-claude-code`, `schedule`, `coordinator`, `team-message`,
+     *    `agent-message`, `subagent-report`, `subagent-settled`, `webhook`,
+     *    `model-selection`, `compact-checkpoint`, `compact-basic`, `ptc-mode`,
+     *    `tool-registry`, `tool-cordis`, `tool-goal`, `tool-jobs` — the rest of
+     *    the same table.
+     *  - `skill-invocation` — a `<skill_content>` block injected by the `/name`
+     *    gesture. The user *did* cause it, but they did not type it, and the block
+     *    is instructions addressed to the model rather than a message to the
+     *    assistant. It reads as context.
+     */
+    private val CONTEXT_SOURCE_KINDS = setOf(
+        "runtime-context",
+        "skill-catalog",
+        "skill-invocation",
+        "agent-instructions",
+        "session-reference",
+        "goal",
+        "plan-mode",
+        "time-context",
+        "tmux-context",
+        "repeat-tool-reminder",
+        "model-selection",
+        "coordinator",
+        "team-message",
+        "agent-message",
+        "subagent-report",
+        "subagent-settled",
+        "webhook",
+        "compact-checkpoint",
+        "compact-basic",
+        "ptc-mode",
+        "tool-registry",
+        "tool-cordis",
+        "tool-goal",
+        "tool-jobs",
+        "hooks-codex",
+        "hooks-claude-code",
+        "schedule",
+    )
+
+    /**
+     * True when a `user/message`'s `source` marks it as Harness-injected context.
+     *
+     * A `user/message` carries its source at `data.source` — it is the payload
+     * itself rather than a nested `message`, unlike every other message-bearing
+     * event — so the caller passes that object in.
+     *
+     * Only a **string** kind counts. A missing source, a null one, or a non-string
+     * kind is treated as a real user message, because the alternative is to hide a
+     * prompt on the strength of a field that was not there.
+     */
+    fun isInjectedContext(source: JSONObject?): Boolean {
+        val kind = source?.optString("kind") ?: return false
+        if (kind.isBlank()) return false
+        if (kind in CONTEXT_SOURCE_KINDS) return true
+        // `plugin:<name>` is how an unrecognised plugin's injected material is
+        // labelled, so it is injected by construction — no first-party producer
+        // prefixes its own name, and a real prompt never carries one at all.
+        return kind.startsWith("plugin:")
+    }
 
     // ------------------------------------------------------------ turn merging
 
@@ -629,10 +734,19 @@ object SessionParser {
      *
      * A `user/message` carries its content at `data.content` rather than under
      * `data.message`, unlike every other message-bearing event.
+     *
+     * Returns null for Harness-injected context, and that is load-bearing. The
+     * caller retires one pending local echo per committed `user/message`, so an
+     * injected snapshot counted as a committed prompt would silently swallow the
+     * optimistic render of something the user actually sent — the message would
+     * vanish until its own event landed. 1.1.7 knew injected context arrived this
+     * way and worked around it with a second, guessing pass; now the source says
+     * which is which, so the guess is not needed.
      */
     fun userTextOf(event: JSONObject): String? {
         if (event.optString("type") != "user/message") return null
         val data = event.optJSONObject("data") ?: return null
+        if (isInjectedContext(data.optJSONObject("source"))) return null
         return textOf(data.optJSONArray("content"))
     }
 

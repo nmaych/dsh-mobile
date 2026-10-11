@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import ai.deepseek.dshmobile.DshApp
+import ai.deepseek.dshmobile.data.ApprovalRequest
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Block
 import ai.deepseek.dshmobile.data.CallIndex
@@ -12,11 +13,11 @@ import ai.deepseek.dshmobile.data.DshClient
 import ai.deepseek.dshmobile.data.DshClient.SessionAddress
 import ai.deepseek.dshmobile.data.LiveAssistant
 import ai.deepseek.dshmobile.data.Message
+import ai.deepseek.dshmobile.data.PermissionPresets
 import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.data.TokenUsage
-import ai.deepseek.dshmobile.data.ToolFiles
 import ai.deepseek.dshmobile.data.Transcript
 import ai.deepseek.dshmobile.data.UserQuestion
 import ai.deepseek.dshmobile.data.WorkspaceFilePage
@@ -184,6 +185,33 @@ data class ChatUiState(
      * they are answered.
      */
     val pendingQuestions: List<UserQuestion> = emptyList(),
+    /**
+     * The `approval/request` waterfalls the agent is waiting on, oldest first.
+     *
+     * Non-empty means a turn is *blocked* on a permission decision: the tool call
+     * is suspended inside the host's approval waterfall. This is the same shape as
+     * [pendingQuestions] and for the same reason — the host delivers each waterfall
+     * once per stream, so a request dropped here could never be answered and would
+     * sit blocked until its wait expired. A list rather than a slot because a
+     * second request can arrive while the first is on screen.
+     */
+    val pendingApprovals: List<ApprovalRequest> = emptyList(),
+    // ---- permission presets ------------------------------------------------
+    /**
+     * The deployment's permission presets, from `permissionPresets/catalog`.
+     *
+     * Empty until loaded, and stays empty on a host without the plugin — which is
+     * what hides the chip rather than offering a switch that cannot work.
+     */
+    val permissionPresets: List<PermissionPresets.Preset> = emptyList(),
+    /** The preset the active session is in, or blank when the host does not say. */
+    val activePermissionPreset: String = "",
+    /** True while the preset catalog is being fetched. */
+    val loadingPermissions: Boolean = false,
+    /** True while a preset switch is in flight. */
+    val switchingPermission: Boolean = false,
+    /** True while the permission picker is on screen. */
+    val showPermissionPicker: Boolean = false,
     // ---- workspace files ---------------------------------------------------
     /**
      * The directory listing currently on screen, or null when the browser is shut.
@@ -203,8 +231,6 @@ data class ChatUiState(
     val openFilePath: String = "",
     /** Why the browser is showing an error instead of entries. */
     val filesError: String? = null,
-    /** True while the transcript is being copied, so the action can be disabled. */
-    val copying: Boolean = false,
     /**
      * The workspace groups currently expanded in the drawer.
      *
@@ -215,24 +241,36 @@ data class ChatUiState(
      * a refresh, which is the whole point of expanding it.
      */
     val expandedGroups: Set<String> = emptySet(),
-    /**
-     * True while the "files the assistant used" list is on screen.
-     *
-     * A flag rather than the list itself, because the *list* is derived from the
-     * transcript and the transcript keeps growing: storing a snapshot would freeze
-     * the list at the moment it was opened, and the button's own visibility would
-     * be one turn out of date. See [ChatUiState.transcriptFiles].
-     */
-    val showTranscriptFiles: Boolean = false,
 ) {
     /** The question the UI is currently asking, if any. */
     val pendingQuestion: UserQuestion? get() = pendingQuestions.firstOrNull()
 
+    /** The approval the UI is currently asking about, if any. */
+    val pendingApproval: ApprovalRequest? get() = pendingApprovals.firstOrNull()
+
+    /**
+     * The active session's preset, as a row the UI can name.
+     *
+     * Falls back to a row built from the raw value so a preset the catalog does not
+     * list — a `custom` derived state, or a table that changed under us — still
+     * reads as *something* rather than as a blank chip. That is the honest
+     * fallback: the session really is in that mode, and hiding it would make the
+     * chip claim the default.
+     */
+    val activePermission: PermissionPresets.Preset?
+        get() {
+            val value = activePermissionPreset
+            if (value.isBlank()) return null
+            return permissionPresets.firstOrNull { it.value == value }
+                ?: PermissionPresets.Preset(value, value, "")
+        }
+
+    /** True when the host offers a preset switch at all. */
+    val permissionSwitchable: Boolean
+        get() = permissionPresets.isNotEmpty() && activePermissionPreset.isNotBlank()
+
     /** What the usage chip renders: settled totals plus the in-flight attempt. */
     val displayUsage: TokenUsage get() = usage + liveUsage
-
-    /** True when the file browser is open. */
-    val filesOpen: Boolean get() = files != null || filesError != null
 
     /**
      * The drawer's session list, grouped by workspace and collapsed when long.
@@ -245,15 +283,16 @@ data class ChatUiState(
         get() = SessionTree.group(sessions, workspaces)
 
     /**
-     * The files this conversation's tool calls referred to, newest first.
+     * True when the file dialog should be on screen.
      *
-     * Derived from the transcript rather than stored, so it is never stale: the
-     * transcript grows one batch at a time, and a stored copy would have to be
-     * refreshed from every one of those paths — the exact shape of bug this
-     * release is fixing elsewhere.
+     * `openFile` counts on its own, and that is the fix for the inline file chips.
+     * The dialog used to be reachable only from the workspace browser, so it was
+     * always opened *after* a listing existed and "the browser has content" was a
+     * sufficient test. A chip on a tool card opens a file directly, with no
+     * listing behind it — under the old definition the dialog simply never
+     * appeared, and the tap looked dead.
      */
-    val transcriptFiles: List<ToolFiles.Ref>
-        get() = ToolFiles.ofTranscript(messages)
+    val filesOpen: Boolean get() = files != null || filesError != null || openFile != null
 }
 
 /**
@@ -690,6 +729,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // The question belonged to the session being left. It is still
             // pending on the host, which re-delivers it when the user returns.
             pendingQuestions = emptyList(),
+            // Same for an approval: its `eventId` names a waterfall on the old
+            // session, and answering it from here would answer the wrong turn.
+            pendingApprovals = emptyList(),
+            // The preset is per-session state, so the old session's value must not
+            // outlive it — the chip would name a mode the new session is not in.
+            activePermissionPreset = "",
+            showPermissionPicker = false,
         )
     }
 
@@ -972,6 +1018,13 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // A question from the previous session must not survive the switch:
             // its `clientId`/`eventId` pair belongs to that session's waterfall.
             pendingQuestions = emptyList(),
+            // And neither must an approval, for the same reason.
+            pendingApprovals = emptyList(),
+            // The preset belongs to the session, so the chip goes blank until the
+            // new session's own projection reports one. Carrying the old value
+            // over would name a mode the new conversation is not in.
+            activePermissionPreset = "",
+            showPermissionPicker = false,
             // The file browser is rooted at the *previous* session's workspace, so
             // its listing describes a directory the new session may not even be
             // able to see. Closing it is the only honest option: keeping it would
@@ -1237,16 +1290,20 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             val asOf = block.optLong("asOfSeq", 0L)
                             // The baseline is authoritative for every key it
                             // carries, so it seeds the watermarks directly.
-                            for (key in listOf("tokenUsage", "contextPressure")) {
+                            for (key in WATCHED_PROJECTIONS) {
                                 projectionSeqs[key] = asOf
                             }
-                            applyProjection(values.optJSONObject("tokenUsage"), values.optJSONObject("contextPressure"))
+                            applyProjection(
+                                values.optJSONObject("tokenUsage"),
+                                values.optJSONObject("contextPressure"),
+                                values.optJSONObject("permissions"),
+                            )
                         }
 
                         "projection" -> {
                             if (frame.optString("sessionId") != sessionId) return@collect
                             val key = frame.optString("key")
-                            if (key != "tokenUsage" && key != "contextPressure") return@collect
+                            if (key !in WATCHED_PROJECTIONS) return@collect
                             val seq = frame.optLong("seq", 0L)
                             // Strictly newer only: an equal seq is the same write
                             // arriving twice, and applying it again is harmless
@@ -1255,8 +1312,9 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             projectionSeqs[key] = seq
                             val value = if (frame.isNull("value")) null else frame.optJSONObject("value")
                             when (key) {
-                                "tokenUsage" -> applyProjection(value, null)
-                                else -> applyProjection(null, value)
+                                "tokenUsage" -> applyProjection(value, null, null)
+                                "contextPressure" -> applyProjection(null, value, null)
+                                else -> applyProjection(null, null, value)
                             }
                         }
                     }
@@ -1265,7 +1323,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Fold one or both projection values into the chip's state.
+     * Fold one or more projection values into the chip's state.
      *
      * A null argument means "this frame did not carry that key", not "the value
      * is empty" — the caller passes null for whichever projection the frame is
@@ -1274,7 +1332,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
      * A *present but null* `tokenUsage` is a real thing (the host can clear a
      * projection), and it maps to a zeroed total rather than being ignored.
      */
-    private fun applyProjection(tokenUsage: JSONObject?, contextPressure: JSONObject?) {
+    private fun applyProjection(
+        tokenUsage: JSONObject?,
+        contextPressure: JSONObject?,
+        permissions: JSONObject?,
+    ) {
         val current = _state.value
         var next = current
         if (tokenUsage != null) {
@@ -1283,6 +1345,14 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (contextPressure != null) {
             val (tokens, window) = DshClient.UsageSnapshot.pressureOf(contextPressure)
             next = next.copy(contextTokens = tokens, contextWindow = window)
+        }
+        if (permissions != null) {
+            // The projection's view is `{currentValue}`. A present-but-null value
+            // is a cleared projection, which is a host that no longer reports the
+            // mode — so the chip hides rather than keeping a stale name.
+            next = next.copy(
+                activePermissionPreset = PermissionPresets.presetOf(permissions).orEmpty(),
+            )
         }
         if (next !== current) _state.value = next
     }
@@ -1325,6 +1395,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     contextTokens = snapshot.contextTokens,
                     contextWindow = snapshot.contextWindow,
                     usageKnown = true,
+                    // Only overwritten when the host reported one: a null here
+                    // means the projection is absent, and clearing the chip on
+                    // that basis would hide a preset that is still in effect.
+                    activePermissionPreset = snapshot.permissionPreset
+                        ?: _state.value.activePermissionPreset,
                 )
             }
         }
@@ -1401,32 +1476,78 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             }
 
                             "waterfall" -> {
-                                val question = UserQuestion.fromFrame(frame, eventsClientId)
-                                    ?: return@collect
-                                // Only the active session's question is shown. A
-                                // question for another session is the host's to hold;
-                                // it will still be pending when the user switches,
-                                // and the host re-delivers pending waterfalls to a
-                                // newly opened stream.
-                                if (question.agentId != _state.value.activeSessionId) return@collect
-                                // Queue rather than replace. The host delivers each
-                                // waterfall once per stream, so a question dropped
-                                // here could never be answered — it would sit blocked
-                                // until its wait expired. A duplicate is ignored so a
-                                // re-delivered frame does not ask the same thing twice.
-                                val queue = _state.value.pendingQuestions
-                                if (queue.any { it.eventId == question.eventId }) return@collect
-                                _state.value = _state.value.copy(
-                                    pendingQuestions = queue + question,
-                                )
+                                // Two waterfalls share this stream: the agent's
+                                // questions and the host's permission requests.
+                                // They are told apart by the `event` name, which is
+                                // the same field the desktop's listeners key on.
+                                // A frame that is neither is ignored rather than
+                                // guessed at — the vocabulary is plugin-extensible.
+                                when (frame.optString("event")) {
+                                    UserQuestion.EVENT_NAME -> {
+                                        val question = UserQuestion.fromFrame(frame, eventsClientId)
+                                            ?: return@collect
+                                        // Only the active session's question is shown. A
+                                        // question for another session is the host's to hold;
+                                        // it will still be pending when the user switches,
+                                        // and the host re-delivers pending waterfalls to a
+                                        // newly opened stream.
+                                        if (question.agentId != _state.value.activeSessionId) {
+                                            return@collect
+                                        }
+                                        // Queue rather than replace. The host delivers each
+                                        // waterfall once per stream, so a question dropped
+                                        // here could never be answered — it would sit blocked
+                                        // until its wait expired. A duplicate is ignored so a
+                                        // re-delivered frame does not ask the same thing twice.
+                                        val queue = _state.value.pendingQuestions
+                                        if (queue.any { it.eventId == question.eventId }) {
+                                            return@collect
+                                        }
+                                        _state.value = _state.value.copy(
+                                            pendingQuestions = queue + question,
+                                        )
+                                    }
+
+                                    ApprovalRequest.EVENT_NAME -> {
+                                        val approval = ApprovalRequest.fromFrame(frame, eventsClientId)
+                                            ?: return@collect
+                                        // Same session filter and same reason as a
+                                        // question: the prompt is about *this*
+                                        // conversation's turn, and a request for
+                                        // another session is re-delivered when the
+                                        // user switches to it.
+                                        if (approval.agentId != _state.value.activeSessionId) {
+                                            return@collect
+                                        }
+                                        val queue = _state.value.pendingApprovals
+                                        if (queue.any { it.eventId == approval.eventId }) {
+                                            return@collect
+                                        }
+                                        _state.value = _state.value.copy(
+                                            pendingApprovals = queue + approval,
+                                        )
+                                    }
+                                }
                             }
 
                             "cancel" -> {
+                                // The host settles a request elsewhere — the
+                                // desktop answered first, or the wait expired — and
+                                // broadcasts a `cancel` for it. Both queues are
+                                // filtered because the two kinds share this frame
+                                // shape and the id spaces are separate; a cancel
+                                // that matches nothing is simply ignored.
                                 val eventId = frame.optString("eventId")
-                                val queue = _state.value.pendingQuestions
-                                if (queue.none { it.eventId == eventId }) return@collect
+                                val questions = _state.value.pendingQuestions
+                                val approvals = _state.value.pendingApprovals
+                                if (questions.none { it.eventId == eventId } &&
+                                    approvals.none { it.eventId == eventId }
+                                ) {
+                                    return@collect
+                                }
                                 _state.value = _state.value.copy(
-                                    pendingQuestions = queue.filterNot { it.eventId == eventId },
+                                    pendingQuestions = questions.filterNot { it.eventId == eventId },
+                                    pendingApprovals = approvals.filterNot { it.eventId == eventId },
                                 )
                             }
                         }
@@ -1495,6 +1616,169 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    /**
+     * Answer the pending approval request.
+     *
+     * The outcome is a **bare string** on the wire, not an object: the host's
+     * listener returns `'allowed-once' | 'rejected'` directly, and the gateway
+     * forwards whatever lossless JSON value the listener produced. That is the one
+     * place this differs from answering a question, and it is why
+     * [DshClient.answerForwardedEvent] takes `Any?` rather than a `JSONObject`.
+     *
+     * The prompt is hidden immediately and put back only if the reply never
+     * reached the host — the same optimistic-then-restore shape as a question. A
+     * round trip is long enough that leaving the card up makes the tap look
+     * ignored, and restoring it on failure is what keeps a lost reply from
+     * silently becoming a rejection: the host fails closed, so an answer that
+     * vanished would look to the user like the assistant simply refused to act.
+     *
+     * @param dismiss true to hide the prompt without answering. The host's
+     *   waterfall is deliberately left running, so the desktop's own answerer can
+     *   still decide; declining here is not a rejection, and sending one would be
+     *   the phone overruling a decision it was never asked to make.
+     */
+    fun answerApproval(decision: ApprovalRequest.Decision?, dismiss: Boolean = false) {
+        val approval = _state.value.pendingApproval ?: return
+        _state.value = _state.value.copy(
+            pendingApprovals = _state.value.pendingApprovals.filterNot {
+                it.eventId == approval.eventId
+            },
+        )
+        if (dismiss || decision == null) return
+
+        val origin = prefs.serverUrl
+        val clientId = eventsClientId
+        viewModelScope.launch {
+            try {
+                dsh.answerForwardedEvent(origin, clientId, approval.eventId, decision.wire)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                // Same reasoning as a question: the host is still waiting, so the
+                // request goes back at the front and the failure is reported.
+                val queue = _state.value.pendingApprovals
+                if (queue.none { it.eventId == approval.eventId }) {
+                    _state.value = _state.value.copy(
+                        pendingApprovals = listOf(approval) + queue,
+                        error = "授权结果没有送达桌面端，请重试。",
+                    )
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------- permission presets
+
+    /**
+     * Load the deployment's permission presets, once.
+     *
+     * The catalog is deployment-wide, so it is fetched the first time it is needed
+     * and reused for every session afterwards. A failure is reported through the
+     * usual transport-aware path rather than as a hard error: the chip simply
+     * stays hidden, which is honest — the app cannot say what modes exist.
+     */
+    fun loadPermissionPresets() {
+        loadPermissionPresets(force = false)
+    }
+
+    /**
+     * Load the permission catalog.
+     *
+     * @param force re-read even when a table is already in hand. The dialog's own
+     *   refresh uses this: the whole point of asking again is that the first
+     *   answer was empty or wrong, and a cache-hit early return would make the
+     *   button do nothing at all.
+     */
+    private fun loadPermissionPresets(force: Boolean) {
+        val origin = prefs.serverUrl
+        if (origin.isBlank()) return
+        if (_state.value.loadingPermissions) return
+        if (!force && _state.value.permissionPresets.isNotEmpty()) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(loadingPermissions = true)
+            val result = try {
+                Result.success(dsh.permissionCatalog(origin))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
+            result
+                .onSuccess { catalog ->
+                    _state.value = _state.value.copy(
+                        loadingPermissions = false,
+                        permissionPresets = catalog.options,
+                    )
+                }
+                .onFailure {
+                    // A host without the plugin answers with an error; that is a
+                    // capability that is absent, not a broken connection, so it is
+                    // not worth a banner. The chip's own visibility is the report.
+                    _state.value = _state.value.copy(loadingPermissions = false)
+                }
+        }
+    }
+
+    /**
+     * Switch the active session's permission preset.
+     *
+     * The switch is a `/permission <preset>` command rather than an RPC, because
+     * that is the only write the package offers — see
+     * [DshClient.selectPermissionPreset]. The new value is *not* written to the
+     * state optimistically: the authoritative value is the `permissions`
+     * projection, and the plugin commits a `permission/preset` event that the
+     * `session/control` stream folds into it. Setting it locally first would make
+     * the chip disagree with the session whenever the command was refused.
+     */
+    fun selectPermissionPreset(preset: String) {
+        val origin = prefs.serverUrl
+        val sessionId = _state.value.activeSessionId ?: return
+        if (_state.value.switchingPermission) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(switchingPermission = true, error = null)
+            try {
+                val text = dsh.selectPermissionPreset(origin, sessionId, preset)
+                _state.value = _state.value.copy(
+                    switchingPermission = false,
+                    showPermissionPicker = false,
+                    info = text ?: "已切换权限模式：$preset",
+                )
+                // The command's own result is not the projection: re-read it so the
+                // chip reflects what the session actually committed.
+                refreshUsage(sessionId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                _state.value = _state.value.copy(
+                    switchingPermission = false,
+                    error = t.message ?: "切换权限模式失败",
+                )
+            }
+        }
+    }
+
+    /** Open the permission picker, fetching the catalog if it is not loaded yet. */
+    fun openPermissionPicker() {
+        _state.value = _state.value.copy(showPermissionPicker = true)
+        loadPermissionPresets()
+    }
+
+    /**
+     * Re-read the catalog for the picker's own refresh button.
+     *
+     * Forces the read rather than reusing the cache, for the reason above: the
+     * only thing a user does with this button is retry a load that gave them
+     * nothing.
+     */
+    fun reloadPermissionPresets() {
+        loadPermissionPresets(force = true)
+    }
+
+    /** Close the permission picker. */
+    fun closePermissionPicker() {
+        _state.value = _state.value.copy(showPermissionPicker = false)
     }
 
     /**
@@ -1690,6 +1974,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             when (m.role) {
                 Role.USER -> out += ChatApi.Msg("user", text)
                 Role.ASSISTANT -> out += ChatApi.Msg("assistant", text)
+                // Context and notices are not part of the API-mode conversation:
+                // they are this app's rendering of the *remote* host's injected
+                // material, and re-sending them as turns would put words in the
+                // user's mouth on a completely different backend.
                 else -> Unit
             }
         }
@@ -2115,39 +2403,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     // ------------------------------------------------------------------- copy
 
     /**
-     * The active transcript as Markdown, for the clipboard.
-     *
-     * Rendering happens on a background dispatcher because a long session is
-     * thousands of blocks, and the copy is triggered from a tap: doing that
-     * string building on the main thread would drop frames exactly while the user
-     * is looking for feedback that the tap registered.
-     */
-    fun copyTranscript(onReady: (String) -> Unit) {
-        if (_state.value.copying) return
-        _state.value = _state.value.copy(copying = true)
-        val messages = _state.value.messages
-        val title = _state.value.activeTitle
-        viewModelScope.launch {
-            val text = withContext(Dispatchers.Default) {
-                Transcript.toMarkdown(messages, title)
-            }
-            _state.value = _state.value.copy(copying = false)
-            onReady(text)
-        }
-    }
-
-    /**
      * Copy one message, for the long-press action on a bubble.
      *
-     * This is the action users actually reach for: "复制" next to the thing being
-     * read, not "copy the whole conversation" in the app bar. The Markdown
-     * rendering is shared with the whole-transcript export so a copied answer and
-     * a copied conversation agree about how a code block or a tool card is
-     * written — two renderers would drift.
+     * This is the *only* copy action now. 1.1.7 put a "复制对话" button in the app
+     * bar and 1.1.8 kept it beside the long press; both were the same mistake in
+     * different sizes. A conversation-long Markdown export is tens of kilobytes on
+     * a real session, it has to be trimmed by hand after pasting, and the thing a
+     * user actually wants is the bubble in front of them. So the app-bar button is
+     * gone and the gesture is the whole feature.
      *
-     * Only the message's own text is offered to the clipboard for a *user*
-     * message; an assistant entry keeps its reasoning and tool cards, because for
-     * an answer those are part of what was said.
+     * The Markdown rendering is still shared with [Transcript.toMarkdown], which
+     * the tests use and which documents the one format a copied answer is written
+     * in — one renderer, so a copied bubble and a copied conversation cannot
+     * disagree about how a code block or a tool card is written.
      */
     fun copyMessage(message: Message, onReady: (String) -> Unit) {
         viewModelScope.launch {
@@ -2173,29 +2441,6 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    /**
-     * Open the file browser on the files the transcript referred to.
-     *
-     * "查看 AI 提供的文件" is a different question from "browse the workspace": the
-     * user does not want to navigate to a file, they want the one the assistant
-     * just produced. So the list is derived from the tool calls and shown directly,
-     * and opening one reads it through the same `workspaceFiles/read` call the
-     * browser uses.
-     */
-    fun openTranscriptFiles() {
-        // Deliberately does not touch `filesError`. That field belongs to the
-        // *workspace browser*, and `filesOpen` is defined as "the browser has
-        // content or an error" — writing an error here would pop the browser open
-        // behind this dialog. The caller only offers the action when the list is
-        // non-empty, so there is nothing to report anyway.
-        _state.value = _state.value.copy(showTranscriptFiles = true)
-    }
-
-    /** Close the list of files the transcript referred to. */
-    fun closeTranscriptFiles() {
-        _state.value = _state.value.copy(showTranscriptFiles = false)
-    }
-
     override fun onCleared() {
         followJob?.cancel()
         usageJob?.cancel()
@@ -2212,6 +2457,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
          * The prefix is load-bearing: [reconcileEchoes] finds these rows by it.
          */
         const val ECHO_PREFIX = "local-"
+
+        /**
+         * The projections the chips read.
+         *
+         * Named once because three places must agree about them: the baseline
+         * seeding, the live frame filter, and the one-shot read's watermark. A key
+         * missing from any one of those is a chip that silently stops updating.
+         */
+        val WATCHED_PROJECTIONS = setOf("tokenUsage", "contextPressure", "permissions")
 
         /**
          * [DshClient.DshException] codes that a reconnect can cure.

@@ -49,13 +49,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import ai.deepseek.dshmobile.data.ApprovalRequest
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.QuestionAnswer
+import ai.deepseek.dshmobile.ui.components.ApprovalDialog
 import ai.deepseek.dshmobile.ui.components.FilesDialog
 import ai.deepseek.dshmobile.ui.components.ModelPickerDialog
+import ai.deepseek.dshmobile.ui.components.PermissionPickerDialog
 import ai.deepseek.dshmobile.ui.components.QuestionDialog
-import ai.deepseek.dshmobile.ui.components.TranscriptFilesDialog
 import ai.deepseek.dshmobile.ui.components.WorkspaceDrawerRow
 import ai.deepseek.dshmobile.ui.components.WorkspacePickerDialog
 import kotlinx.coroutines.launch
@@ -99,6 +101,7 @@ fun AppShell(
     onCheckUpdate: () -> Unit,
     onInstallUpdate: () -> Unit,
     onAnswerQuestion: (List<QuestionAnswer>, Boolean) -> Unit,
+    onAnswerApproval: (ApprovalRequest.Decision?, Boolean) -> Unit,
     onOpenFiles: () -> Unit,
     onOpenFilesChild: (String) -> Unit,
     onOpenWorkspaceFile: (String) -> Unit,
@@ -109,15 +112,16 @@ fun AppShell(
     /**
      * Copy text to the clipboard, returning it to the caller to place.
      *
-     * The rendering happens in the view model (a transcript is large, and
+     * The rendering happens in the view model (a message can be large, and
      * building it on the main thread would drop frames during the tap), so the
      * callback is how the finished string gets here to be handed to the
      * `ClipboardManager` — which needs a `Context` the view model does not have.
      */
-    onCopyTranscript: (((String) -> Unit)) -> Unit,
     onCopyMessage: (Message, (String) -> Unit) -> Unit,
-    onOpenTranscriptFiles: () -> Unit,
-    onCloseTranscriptFiles: () -> Unit,
+    onOpenPermissionPicker: () -> Unit,
+    onPickPermission: (String) -> Unit,
+    onReloadPermissionPresets: () -> Unit,
+    onClosePermissionPicker: () -> Unit,
     onToggleGroup: (String) -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
@@ -140,30 +144,35 @@ fun AppShell(
         )
     }
 
-    // The files this conversation's tool calls named. Composed beside the
-    // question dialog and for the same reason: it is opened from the transcript's
-    // app bar, so a result that arrives while the user is in settings must still
-    // be shown rather than silently dropped.
-    if (state.showTranscriptFiles) {
-        TranscriptFilesDialog(
-            files = state.transcriptFiles,
-            onOpen = { path ->
-                onCloseTranscriptFiles()
-                onOpenWorkspaceFile(path)
-            },
-            onBrowse = {
-                onCloseTranscriptFiles()
-                onOpenFiles()
-            },
-            onDismiss = onCloseTranscriptFiles,
+    // The approval request is composed for the same reason and above the same
+    // early return: it is a tool call suspended inside the host's approval
+    // waterfall, and the seam fails closed, so a request the user never sees is an
+    // operation that silently does not happen.
+    state.pendingApproval?.let { pending ->
+        ApprovalDialog(
+            request = pending,
+            onDecide = { decision -> onAnswerApproval(decision, false) },
+            onDismiss = { onAnswerApproval(null, true) },
         )
     }
 
-    // The file browser, composed above the settings early return for the same
-    // reason as the question dialog: it is opened from the transcript's app bar,
-    // but a user who wandered into settings while it was loading must still see
-    // the result of what they asked for rather than a screen that quietly
-    // dropped it.
+    if (state.showPermissionPicker) {
+        PermissionPickerDialog(
+            presets = state.permissionPresets,
+            current = state.activePermissionPreset,
+            loading = state.loadingPermissions,
+            switching = state.switchingPermission,
+            onPick = onPickPermission,
+            onReload = onReloadPermissionPresets,
+            onDismiss = onClosePermissionPicker,
+        )
+    }
+
+    // The file dialog, composed above the settings early return for the same
+    // reason as the question dialog: it is opened from a chip inside the
+    // transcript, but a user who wandered into settings while it was loading must
+    // still see the result of what they asked for rather than a screen that
+    // quietly dropped it.
     if (state.filesOpen) {
         FilesDialog(
             listing = state.files,
@@ -178,6 +187,9 @@ fun AppShell(
             onUp = onFilesUp,
             onCloseFile = onCloseWorkspaceFile,
             onReload = onFilesReload,
+            // The browser's entry point is now inside this dialog: the app bar's
+            // button is gone, so a chip's file view is what offers it.
+            onBrowse = onOpenFiles,
             onDismiss = onCloseFiles,
         )
     }
@@ -286,10 +298,12 @@ fun AppShell(
             onDismissError = onDismissError,
             onOpenModelPicker = openModelPicker,
             onOpenWorkspacePicker = { showWorkspacePicker = true },
-            onOpenFiles = onOpenFiles,
-            onCopyTranscript = onCopyTranscript,
+            onOpenPermissionPicker = onOpenPermissionPicker,
             onCopyMessage = onCopyMessage,
-            onOpenTranscriptFiles = onOpenTranscriptFiles,
+            // A file chip in the transcript opens it straight into the viewer.
+            // There is no listing behind it, which is why `filesOpen` counts an
+            // open file on its own.
+            onOpenFile = onOpenWorkspaceFile,
         )
     }
 

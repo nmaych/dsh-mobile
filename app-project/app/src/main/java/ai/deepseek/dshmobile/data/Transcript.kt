@@ -62,6 +62,11 @@ object Transcript {
     private fun roleLabel(role: Role): String = when (role) {
         Role.USER -> "你"
         Role.ASSISTANT -> "助手"
+        // Injected context is not a speaker. Labelling it "系统" keeps it out of
+        // the user's voice, which is the whole point: the export used to attribute
+        // the runtime-context snapshot to "你" and so recorded the user as having
+        // written boilerplate they never saw.
+        Role.CONTEXT -> "上下文"
         Role.SYSTEM, Role.TOOL -> "系统"
     }
 

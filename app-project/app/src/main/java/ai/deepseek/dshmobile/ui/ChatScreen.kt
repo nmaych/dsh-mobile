@@ -34,11 +34,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
@@ -148,10 +147,9 @@ fun ChatScreen(
     onDismissError: () -> Unit,
     onOpenModelPicker: () -> Unit,
     onOpenWorkspacePicker: () -> Unit,
-    onOpenFiles: () -> Unit,
-    onCopyTranscript: (((String) -> Unit)) -> Unit,
+    onOpenPermissionPicker: () -> Unit,
     onCopyMessage: (Message, (String) -> Unit) -> Unit,
-    onOpenTranscriptFiles: () -> Unit,
+    onOpenFile: (String) -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -301,44 +299,6 @@ fun ChatScreen(
                         IconButton(onClick = onRefresh) {
                             Icon(Icons.Default.Refresh, contentDescription = "刷新")
                         }
-                        // Both actions are offered only when they can do
-                        // something: copying an empty transcript would put a
-                        // heading and "暂无内容" on the clipboard, and the file
-                        // browser is rooted at a session's workspace, so with no
-                        // session there is no root to show.
-                        if (state.messages.isNotEmpty()) {
-                            IconButton(
-                                onClick = { onCopyTranscript { text ->
-                                    clipboard.setText(AnnotatedString(text))
-                                } },
-                                enabled = !state.copying,
-                            ) {
-                                Icon(
-                                    Icons.Default.ContentCopy,
-                                    contentDescription = "复制对话",
-                                )
-                            }
-                        }
-                        if (state.activeSessionId != null) {
-                            IconButton(onClick = onOpenFiles) {
-                                Icon(
-                                    Icons.Default.FolderOpen,
-                                    contentDescription = "查看文件",
-                                )
-                            }
-                            // "查看 AI 提供的文件": the files this conversation's
-                            // tool calls named, without navigating the workspace.
-                            // Offered only when there are any, so the button never
-                            // leads to an empty list.
-                            if (state.transcriptFiles.isNotEmpty()) {
-                                IconButton(onClick = onOpenTranscriptFiles) {
-                                    Icon(
-                                        Icons.Default.Description,
-                                        contentDescription = "查看助手用到的文件",
-                                    )
-                                }
-                            }
-                        }
                     }
                     IconButton(onClick = onOpenSettings) {
                         Icon(Icons.Default.Settings, contentDescription = "设置")
@@ -376,6 +336,7 @@ fun ChatScreen(
                     state = state,
                     onOpenModelPicker = onOpenModelPicker,
                     onOpenWorkspacePicker = onOpenWorkspacePicker,
+                    onOpenPermissionPicker = onOpenPermissionPicker,
                 )
             }
 
@@ -397,6 +358,10 @@ fun ChatScreen(
                                         clipboard.setText(AnnotatedString(text))
                                     }
                                 },
+                                // Null in API mode: there is no workspace behind a
+                                // local conversation, so a chip there would be a
+                                // button that cannot work.
+                                onOpenFile = if (state.backend == Backend.REMOTE) onOpenFile else null,
                             )
                         }
                     }
@@ -465,6 +430,7 @@ private fun RemoteChipsRow(
     state: ChatUiState,
     onOpenModelPicker: () -> Unit,
     onOpenWorkspacePicker: () -> Unit,
+    onOpenPermissionPicker: () -> Unit,
 ) {
     val workspace = state.workspaces.firstOrNull { it.id == state.selectedWorkspaceId }
     FlowRow(
@@ -531,6 +497,19 @@ private fun RemoteChipsRow(
                 )
             }
         }
+        // The permission mode is the difference between "it can do the thing" and
+        // "it will stop and ask", so it belongs on this strip next to the model
+        // and the workspace — the three are the facts a turn depends on. It is
+        // offered only when the host both reports a mode and lists alternatives:
+        // a chip that cannot change anything is a control that lies.
+        if (state.permissionSwitchable) {
+            PermissionChip(
+                label = state.activePermission?.label ?: state.activePermissionPreset,
+                enabled = state.connected && !state.switchingPermission,
+                onClick = onOpenPermissionPicker,
+                modifier = Modifier.align(Alignment.CenterVertically),
+            )
+        }
         if (state.usageKnown) {
             UsageChip(
                 usage = state.displayUsage,
@@ -540,6 +519,76 @@ private fun RemoteChipsRow(
                 // Material3 does *not* pad out to 48dp. It has to be centred
                 // explicitly or it sits above its neighbours in landscape.
                 modifier = Modifier.align(Alignment.CenterVertically),
+            )
+        }
+    }
+}
+
+/**
+ * The permission-mode chip.
+ *
+ * A sibling of the workspace chip rather than a bespoke control, because it is
+ * the same kind of fact — a per-conversation setting the next turn depends on —
+ * and it should read as one of a row rather than as something unusual. It is
+ * bounded in width for the same reason the model chip is: a deployment may name
+ * its presets anything, and one long name must not push the other chips off the
+ * line.
+ *
+ * The warning tint is reserved for a preset that is *not* the confined default.
+ * That is the one case where the mode changes what the assistant can do to the
+ * user's machine, and a chip that looks identical in every mode is one nobody
+ * reads.
+ */
+@Composable
+private fun PermissionChip(
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // `danger-full-access` is the shipped unrestricted preset. A deployment can
+    // rename it, so this is a hint rather than a rule: an unrecognised preset is
+    // drawn neutrally rather than alarming.
+    val unrestricted = label.contains("danger", ignoreCase = true) ||
+        label.contains("full", ignoreCase = true)
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        color = if (unrestricted) {
+            MaterialTheme.colorScheme.error.copy(alpha = 0.12f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+        },
+        shape = RoundedCornerShape(6.dp),
+        modifier = modifier.wrapContentHeight(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                Icons.Default.Lock,
+                contentDescription = null,
+                modifier = Modifier.size(10.dp),
+                tint = if (unrestricted) MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.primary,
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                label,
+                fontSize = 9.5.sp,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+                color = if (unrestricted) MaterialTheme.colorScheme.error
+                else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.widthIn(max = 110.dp),
+            )
+            Icon(
+                Icons.Default.ExpandMore,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

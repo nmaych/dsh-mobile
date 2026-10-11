@@ -1077,6 +1077,17 @@ class DshClient(private val prefs: Prefs) {
         val contextWindow: Long?,
         val contextTokens: Long?,
         /**
+         * The session's active permission preset, when the host reports one.
+         *
+         * Read from the same `session/projections` response as the token figures
+         * because it is the same call: the `permissions` projection is one more
+         * value in the `values` object, and a second round trip to read one string
+         * would be a second chance to fail. Null means the host has no
+         * permission-presets plugin mounted, which is different from a session
+         * being in no particular preset.
+         */
+        val permissionPreset: String? = null,
+        /**
          * The session log sequence these values were taken at.
          *
          * `session/projections` answers with `asOfSeq`, and the live
@@ -1137,8 +1148,79 @@ class DshClient(private val prefs: Prefs) {
             total = UsageSnapshot.usageOf(values.optJSONObject("tokenUsage")),
             contextWindow = window,
             contextTokens = context,
+            // Read through the shared reader rather than reaching into `values`
+            // here, so the one-shot path and the live `session/control` frames
+            // cannot disagree about where the preset lives.
+            permissionPreset = PermissionPresets.currentOf(value),
             asOfSeq = value.optLong("asOfSeq", 0L),
         )
+    }
+
+    // ---------------------------------------------------------- permissions
+
+    /**
+     * The deployment's permission presets.
+     *
+     * `permissionPresets/catalog` declares **no parameters**, so `args` must be
+     * empty: the gateway rejects a request whose keys do not match the descriptor,
+     * and an extra key here fails every time. It is deployment-wide rather than
+     * per-session, so it is fetched once and reused.
+     */
+    suspend fun permissionCatalog(origin: String): PermissionPresets.Catalog {
+        val value = rpc(origin, "permissionPresets", "catalog")
+        return PermissionPresets.catalogOf(value)
+    }
+
+    /**
+     * Switch a session's permission preset.
+     *
+     * There is no `permissionPresets/select` RPC — the package exposes only the
+     * read — so the write is the plugin's own `/permission <preset>` slash
+     * command, dispatched through `commands/execute`. That is the same path the
+     * desktop's picker takes, so the two cannot drift about what switching means.
+     *
+     * `commands/execute` is **agent-scoped**: its first parameter is resolved from
+     * the `agentId` wire field rather than passed as a value, so the session id
+     * goes in `agentId`. The remaining two parameters are `line` (the command
+     * text) and `submittedAttachments` (staged images and file receipts). The
+     * descriptor does *not* mark `submittedAttachments` omissible, so an absent
+     * key is a `gateway/arguments-invalid`; it is sent as an empty array, which is
+     * also what the desktop sends for a plain invocation.
+     *
+     * @return the command's own result text, when it produced one.
+     * @throws DshException when the command is not offered by the host, or the
+     *   preset was refused. Both are reported rather than swallowed: a switch that
+     *   silently does nothing looks exactly like a broken button.
+     */
+    suspend fun selectPermissionPreset(
+        origin: String,
+        sessionId: String,
+        preset: String,
+    ): String? {
+        val value = rpc(
+            origin, "commands", "execute",
+            JSONObject()
+                .put("agentId", sessionId)
+                .put("line", PermissionPresets.switchLine(preset))
+                .put("submittedAttachments", JSONArray()),
+        )
+        // `undefined` is the documented result for a line that resolved to no
+        // command at all — an unknown name or bad syntax. `rpc` answers with an
+        // empty object for a null value, so a missing `commandId` is that case.
+        if (!value.has("commandId")) {
+            throw DshException(
+                "桌面端没有提供 /permission 命令，无法在手机上切换权限模式。",
+                "permission/command-unavailable",
+            )
+        }
+        val result = value.optJSONObject("result") ?: return null
+        if (result.optString("kind") == "error") {
+            throw DshException(
+                result.optString("text").ifBlank { "切换权限模式失败" },
+                "permission/switch-failed",
+            )
+        }
+        return result.optString("text").takeIf { it.isNotBlank() }
     }
 
     /**
@@ -1228,6 +1310,12 @@ class DshClient(private val prefs: Prefs) {
      * That is the desired outcome — the desktop answered first — so there is
      * nothing to report and nothing to retry.
      *
+     * @param value the answer to return as the waterfall's value, or null to
+     *   decline. It is `Any?` rather than `JSONObject` because the two waterfalls
+     *   this app answers disagree about their value's shape: a question answers
+     *   with an object (`{answers:[…]}`), while an approval answers with a bare
+     *   wire string (`"allowed-once"`). Both are lossless JSON, which is the only
+     *   thing the host requires of a listener's return value.
      * @throws IOException-family failures from [rpc] when the reply could not be
      *   delivered at all, so the caller can put the question back rather than
      *   discarding an answer the host is still waiting for.
@@ -1236,12 +1324,12 @@ class DshClient(private val prefs: Prefs) {
         origin: String,
         clientId: String,
         eventId: String,
-        answer: JSONObject?,
+        value: Any?,
     ) {
-        val outcome = if (answer == null) {
+        val outcome = if (value == null) {
             JSONObject().put("kind", "next")
         } else {
-            JSONObject().put("kind", "result").put("value", answer)
+            JSONObject().put("kind", "result").put("value", value)
         }
         val args = JSONObject()
             .put("clientId", clientId)
