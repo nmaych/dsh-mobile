@@ -76,14 +76,21 @@ check('release.yml does not accept the unsigned artifact', () => {
   // The negative half, and the one that actually encodes the bug. If a future
   // edit "fixes" a missing-file failure by also accepting the unsigned name, the
   // release would silently ship an unsigned APK — which is a worse outcome than
-  // the red build it was trying to clear.
+  // the red build it was trying to clear. An unsigned APK cannot be installed
+  // over an existing one at all, so it is not a fallback.
   const verifyStep = releaseYml.slice(releaseYml.indexOf('name: Verify APK'))
   const verifyBody = verifyStep.slice(0, verifyStep.indexOf('name: Generate update.json'))
-  assert.doesNotMatch(
-    verifyBody,
-    new RegExp(`cp\\s+"?\\$?\\{?[A-Z_]*\\}?/?${UNSIGNED_APK.replace('.', '\\.')}`),
-    'the verify step must never copy the unsigned APK as the release artifact',
-  )
+  // The copy that produces the published asset must source the signed path, and
+  // the unsigned name may only appear inside the diagnostic.
+  assert.match(verifyBody, /cp "\$APK"/, 'the release asset must be copied from $APK')
+  for (const line of verifyBody.split('\n')) {
+    if (!line.includes(UNSIGNED_APK)) continue
+    assert.match(
+      line,
+      /^\s*(#|if \[|echo|ls)/,
+      `the unsigned name may only appear in a diagnostic, not in a copy: ${line.trim()}`,
+    )
+  }
 })
 
 check('the failure message names the unsigned file', () => {
