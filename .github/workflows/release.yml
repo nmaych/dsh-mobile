@@ -88,6 +88,12 @@ jobs:
       - name: Test release logic
         run: node test/release-logic.test.mjs
 
+      # And prove the artifact contract: the path this workflow reads below must be
+      # the path Gradle writes. This is the check whose absence let every previous
+      # tagged release fail at "No release APK produced".
+      - name: Test release artifact contract
+        run: node test/release-artifact.test.mjs
+
       # ---------------------------------------------------------------------
       # Materialise the keystore from secrets.
       #
@@ -107,6 +113,35 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "DSH_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
           echo "Keystore decoded ($(stat -c%s "$RUNNER_TEMP/release.jks") bytes)"
+
+      # ---------------------------------------------------------------------
+      # All four signing secrets, or a precise error here.
+      #
+      # An unset secret expands to the empty string, and the Gradle script treats
+      # a *partial* signing configuration as a hard error — because the failure it
+      # used to cause was nearly undiagnosable: the build succeeded, AGP named the
+      # unsigned artifact `app-release-unsigned.apk`, and this workflow then went
+      # looking for `app-release.apk` and reported only "No release APK produced".
+      # That message named neither the file that was built nor the reason it was
+      # unsigned. Checking here means a missing secret is reported as a missing
+      # secret, at the step that owns it.
+      # ---------------------------------------------------------------------
+      - name: Check signing secrets
+        env:
+          DSH_KEYSTORE_PASSWORD: ${{ secrets.DSH_KEYSTORE_PASSWORD }}
+          DSH_KEY_ALIAS: ${{ secrets.DSH_KEY_ALIAS }}
+          DSH_KEY_PASSWORD: ${{ secrets.DSH_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${DSH_KEYSTORE_PASSWORD:-}" ] || missing+=("DSH_KEYSTORE_PASSWORD")
+          [ -n "${DSH_KEY_ALIAS:-}" ]         || missing+=("DSH_KEY_ALIAS")
+          [ -n "${DSH_KEY_PASSWORD:-}" ]      || missing+=("DSH_KEY_PASSWORD")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing signing secret(s): ${missing[*]}. All four are required to publish; see docs/RELEASING.md."
+            exit 1
+          fi
+          echo "All four signing secrets are present."
 
       - name: Build signed release
         working-directory: app-project
@@ -137,8 +172,21 @@ jobs:
           EXPECTED_NAME: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          APK="app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK" || { echo "::error::No release APK produced"; exit 1; }
+          OUT_DIR="app/build/outputs/apk/release"
+          APK="$OUT_DIR/app-release.apk"
+
+          # Name the real problem rather than "not found". An unsigned build
+          # produces `app-release-unsigned.apk` instead, and the two are easy to
+          # confuse from a path that only says "no such file".
+          if [ ! -f "$APK" ]; then
+            echo "::error::Expected $APK but it is not there."
+            echo "--- $OUT_DIR ---"
+            ls -la "$OUT_DIR" || true
+            if [ -f "$OUT_DIR/app-release-unsigned.apk" ]; then
+              echo "::error::The build produced app-release-unsigned.apk, so signing did not run. Check the four signing secrets and that DSH_KEYSTORE_FILE was set before the build step."
+            fi
+            exit 1
+          fi
 
           AAPT2="$ANDROID_HOME/build-tools/34.0.0/aapt2"
           BADGING="$("$AAPT2" dump badging "$APK")"

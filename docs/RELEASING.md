@@ -210,6 +210,33 @@ build.cmd assembleRelease
 
 四个 Secrets 没配全。回到「一次性设置」。
 
+**Release 失败：`No release APK produced` / 找不到 `app-release.apk`**
+
+先看构建目录里到底有什么：
+
+```sh
+ls -la app-project/app/build/outputs/apk/release/
+```
+
+如果里面是 **`app-release-unsigned.apk`** 而不是 `app-release.apk`，那就是**签名没生效**——
+AGP 在没挂签名配置时用的就是 `-unsigned` 这个名字。这不是构建失败：构建是成功的，
+只是产物换了名字，所以日志里什么错误都没有，只有那句「没有 APK」。
+
+原因是四个签名输入**只给了一部分**（最常见的是一个或多个 Secret 没配，
+而未配置的 Secret 会展开成**空字符串**，不是「不存在」）。现在这种情况会让
+Gradle 直接报错并点名缺哪几个：
+
+```
+Incomplete release signing configuration: 1 of 4 inputs are present,
+missing storePassword (DSH_KEYSTORE_PASSWORD), keyAlias (DSH_KEY_ALIAS), ...
+```
+
+修法是补齐 Secrets，而不是让工作流去接受 `-unsigned` 那个文件——
+未签名的 APK 根本装不上去（Android 拒绝签名变更），发出去比构建失败更糟。
+
+> 本地看不见这个问题：开发者有 `keystore.properties`（已被 gitignore），
+> 所以本地构建总是签名的。和 `gradlew` 的可执行位一样，它只在 CI 上坏。
+
 **Release 失败：`versionCode 1 != 10200`**
 
 tag 与构建产物不一致。最常见的原因是 tag 打错了（比如 `v1.2` 少了补丁号）。

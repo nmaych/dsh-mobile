@@ -44,6 +44,17 @@ jobs:
       - name: Test release metadata
         run: node test/release-logic.test.mjs
 
+      # Guards the release *artifact contract*: the path release.yml reads must be
+      # the path Gradle writes. AGP only names a signed release `app-release.apk`;
+      # with no signing config it writes `app-release-unsigned.apk`, and every
+      # tagged release failed with "No release APK produced" because the workflow
+      # hardcoded the signed name. Nothing else can see this: the compiler never
+      # reads either filename, and a local build always signs (keystore.properties
+      # is gitignored), so it was broken only on CI — the same shape as the
+      # gradlew executable bit that repo-hygiene guards.
+      - name: Test release artifact contract
+        run: node test/release-artifact.test.mjs
+
       # Guards the wire contract with the dsh-mobile-connect desktop plugin.
       # A renamed endpoint is invisible to the Kotlin compiler but makes the
       # app unable to pair at all, which is exactly what shipped in 1.1.0.

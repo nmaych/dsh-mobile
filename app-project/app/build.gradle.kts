@@ -52,10 +52,44 @@ val signingKeyAlias: String? =
 val signingKeyPassword: String? =
     System.getenv("DSH_KEY_PASSWORD") ?: keystoreProps.getProperty("keyPassword")
 
-val hasSigning = signingStoreFile != null &&
-    !signingStorePassword.isNullOrBlank() &&
-    !signingKeyAlias.isNullOrBlank() &&
-    !signingKeyPassword.isNullOrBlank()
+// ---------------------------------------------------------------------------
+// All four signing inputs, or none of them.
+//
+// The two legitimate states are "no signing inputs at all" (a fresh clone, a PR,
+// a compile check — the build stays unsigned so those keep working) and "all four
+// present" (a release). A *partial* configuration is always a mistake, and it
+// used to be the most expensive kind: the conjunction below silently became
+// false, AGP built an **unsigned** APK, and the only symptom was that it landed
+// under a different filename. That is exactly how every tagged release failed:
+// `release.yml` looked for `app-release.apk`, found nothing, and reported
+// "No release APK produced" — naming neither the file that was built nor why it
+// was unsigned.
+//
+// So the partial case is a hard error that names the missing variables. The
+// release workflow passes the keystore through `DSH_KEYSTORE_FILE` and the three
+// credentials from repository secrets; an unset secret expands to the empty
+// string, which is what this catches.
+// ---------------------------------------------------------------------------
+val signingInputs = listOf(
+    "storeFile (DSH_KEYSTORE_FILE)" to signingStoreFile?.absolutePath,
+    "storePassword (DSH_KEYSTORE_PASSWORD)" to signingStorePassword,
+    "keyAlias (DSH_KEY_ALIAS)" to signingKeyAlias,
+    "keyPassword (DSH_KEY_PASSWORD)" to signingKeyPassword,
+)
+val providedSigningInputs = signingInputs.count { !it.second.isNullOrBlank() }
+val hasSigning = providedSigningInputs == signingInputs.size
+
+if (providedSigningInputs in 1 until signingInputs.size) {
+    val missing = signingInputs.filter { it.second.isNullOrBlank() }.joinToString(", ") { it.first }
+    error(
+        "Incomplete release signing configuration: ${providedSigningInputs} of " +
+            "${signingInputs.size} inputs are present, missing $missing. " +
+            "Signing is all-or-nothing: provide every input, or none of them to " +
+            "build unsigned. An unsigned release APK is named " +
+            "`app-release-unsigned.apk`, so a workflow expecting " +
+            "`app-release.apk` will not find it.",
+    )
+}
 
 android {
     namespace = "ai.deepseek.dshmobile"
