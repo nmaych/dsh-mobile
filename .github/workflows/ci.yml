@@ -141,6 +141,19 @@ jobs:
       - name: Test 1.1.9 regressions
         run: node test/regression-1.1.9.test.mjs
 
+      # Guards the 1.2.0 changes. Four reported bugs and two new capabilities:
+      # the long press now opens a dialog whose body is selectable instead of
+      # writing the whole message to the clipboard; the app-bar refresh re-syncs
+      # the open transcript and reports itself instead of only reloading the
+      # off-screen drawer list; `session/follow` re-arms instead of being
+      # subscribed once, which is what left the phone deaf while the desktop kept
+      # streaming; and Agent presets (模式) are selectable. The new features are the
+      # delivered-files sheet and Markdown rendering for `.md` files. The mode
+      # parser and the Markdown extension reader are pure functions, so they get
+      # differential tests as well as static assertions.
+      - name: Test 1.2.0 regressions
+        run: node test/regression-1.2.0.test.mjs
+
       # Guards repository invariants the build depends on but nothing local can
       # see — chiefly the Gradle wrapper's executable bit, whose absence failed
       # this very job with "./gradlew: Permission denied" (exit 126) while every

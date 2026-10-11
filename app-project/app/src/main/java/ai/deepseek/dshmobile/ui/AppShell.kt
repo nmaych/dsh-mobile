@@ -53,7 +53,9 @@ import ai.deepseek.dshmobile.data.ApprovalRequest
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Message
 import ai.deepseek.dshmobile.data.QuestionAnswer
+import ai.deepseek.dshmobile.ui.components.AgentPresetPickerDialog
 import ai.deepseek.dshmobile.ui.components.ApprovalDialog
+import ai.deepseek.dshmobile.ui.components.DeliverablesDialog
 import ai.deepseek.dshmobile.ui.components.FilesDialog
 import ai.deepseek.dshmobile.ui.components.ModelPickerDialog
 import ai.deepseek.dshmobile.ui.components.PermissionPickerDialog
@@ -80,6 +82,15 @@ fun AppShell(
     onNewSession: () -> Unit,
     onOpenSession: (String) -> Unit,
     onRefresh: () -> Unit,
+    /**
+     * The app-bar refresh: reloads the list *and* re-syncs the transcript.
+     *
+     * Separate from [onRefresh] because the two have different jobs. The drawer's
+     * refresh reloads a list the user is looking at; the app-bar one also has to
+     * catch the conversation up on anything the phone missed, and report that it
+     * ran. Wiring both to one action is what made the app-bar button look dead.
+     */
+    onManualRefresh: () -> Unit,
     onDismissError: () -> Unit,
     onBackendChange: (Backend) -> Unit,
     onPair: (String) -> Unit,
@@ -122,6 +133,12 @@ fun AppShell(
     onPickPermission: (String) -> Unit,
     onReloadPermissionPresets: () -> Unit,
     onClosePermissionPicker: () -> Unit,
+    onOpenAgentPresetPicker: () -> Unit,
+    onPickAgentPreset: (String) -> Unit,
+    onReloadAgentPresets: () -> Unit,
+    onCloseAgentPresetPicker: () -> Unit,
+    onOpenDeliverables: () -> Unit,
+    onCloseDeliverables: () -> Unit,
     onToggleGroup: (String) -> Unit,
 ) {
     var showSettings by remember { mutableStateOf(false) }
@@ -165,6 +182,41 @@ fun AppShell(
             onPick = onPickPermission,
             onReload = onReloadPermissionPresets,
             onDismiss = onClosePermissionPicker,
+        )
+    }
+
+    // The mode picker, composed above the settings early return for the same reason
+    // as the others: it is opened from a chip in the transcript, and a user who
+    // wandered into settings while the roster loaded must still see the result of
+    // what they asked for.
+    if (state.showAgentPresetPicker) {
+        AgentPresetPickerDialog(
+            presets = state.agentPresets,
+            current = state.activeAgentPreset,
+            pending = state.selectedAgentPreset,
+            locked = state.agentPresetLocked,
+            loading = state.loadingAgentPresets,
+            switching = state.switchingAgentPreset,
+            onPick = onPickAgentPreset,
+            onReload = onReloadAgentPresets,
+            onDismiss = onCloseAgentPresetPicker,
+        )
+    }
+
+    // The delivered-files sheet. Composed here rather than inside the chat screen
+    // because opening a file from it reuses the *same* file dialog as a chip does —
+    // so the two must be siblings, or the file viewer would be composed twice.
+    if (state.showDeliverables) {
+        DeliverablesDialog(
+            files = state.deliverables,
+            onOpen = onOpenWorkspaceFile,
+            // "浏览工作区" hands off to the workspace browser, so the two entry
+            // points lead to the same place rather than being parallel universes.
+            onBrowse = {
+                onCloseDeliverables()
+                onOpenFiles()
+            },
+            onDismiss = onCloseDeliverables,
         )
     }
 
@@ -294,11 +346,17 @@ fun AppShell(
             onOpenDrawer = { scope.launch { drawerState.open() } },
             onOpenSettings = { showSettings = true },
             onNewSession = onNewSession,
-            onRefresh = onRefresh,
+            // The app-bar refresh is the *manual* one: it re-syncs the transcript
+            // as well as the list, and reports itself. The drawer's own refresh
+            // button stays on the quiet `onRefresh`, because a spinner and a result
+            // line would be noise in a list that is visibly reloading anyway.
+            onRefresh = onManualRefresh,
             onDismissError = onDismissError,
             onOpenModelPicker = openModelPicker,
             onOpenWorkspacePicker = { showWorkspacePicker = true },
             onOpenPermissionPicker = onOpenPermissionPicker,
+            onOpenAgentPresetPicker = onOpenAgentPresetPicker,
+            onOpenDeliverables = onOpenDeliverables,
             onCopyMessage = onCopyMessage,
             // A file chip in the transcript opens it straight into the viewer.
             // There is no listing behind it, which is why `filesOpen` counts an

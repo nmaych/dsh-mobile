@@ -543,6 +543,96 @@ Cookie: <会话Cookie>
 
 结果里 `result.kind` 为 `error` 时 `result.text` 是拒绝的原因。
 
+### `agentPresets`：Agent 预设 / 模式（1.2.0 起）
+
+**和 `permissionPresets` 不是一回事**，虽然两者在界面上都被叫做「模式」：
+`permissionPresets` 是**策略**（命令能碰多少文件系统、要不要先问人），
+`agentPresets` 是**组合**（交给助手哪些工具、按什么方式工作）。桌面端自己的帮助文本
+也这么划线：「模式是一份 Agent 预设，用来选择任务可用的工具，并约定 Agent 的工作方式…
+审查要求用于指导 Agent，实际可执行的操作仍由权限设置决定」。
+
+三个方法，都是 unary：
+
+| 方法 | args | 结果 |
+|---|---|---|
+| `agentPresets/list` | `{}`（**无参数**，多一个键就 `gateway/arguments-invalid`） | `{"presets":[…]}` |
+| `agentPresets/read` | `{"agentPreset":"standard"}` | `{"agentPreset","content","name?","description?"}` |
+| `agentPresets/select` | `{"agentId":"session-…","agentPreset":"ptc"}` | **裸字符串**（提交后的 id） |
+
+#### `agentPresets/list` 的行
+
+```json
+{ "presets": [ { "id": "standard", "isDefault": true },
+               { "id": "ptc" },
+               { "id": "minimal" },
+               { "id": "cordis" },
+               { "id": "my-review", "name": "代码审查", "description": "…" },
+               { "id": "broken-one", "broken": "…" } ] }
+```
+
+- `id` 是**唯一的身份**，选择时发回去的就是它；没有 `id` 的行必须丢掉，因为一行
+  「选不了」的预设是 UI 兑现不了的承诺。
+- **内置四个不发布 `name` / `description`**。桌面端自己走 locale 词典
+  （`@deepseek-ai/dsh-agent-preset-registry/display` 的 `BUILT_IN_PRESET_KEYS`，键就是
+  上面那四个 id），所以客户端要显示中文就得自己兜底，否则会显示成 `standard`。
+  **声明里带了名字的预设按原文显示**，不能被兜底覆盖。
+- `broken` 非空表示这条声明**激活失败**。要**列出来但禁选**，并把这条诊断显示出来：
+  藏起来会让列表和桌面端不一致，而这条诊断是用户唯一能知道「我建的模式为什么没了」
+  的地方。
+
+内置四个的 id 与桌面端中文名：`standard` = 标准模式、`ptc` = PTC 模式、
+`minimal` = 极简模式、`cordis` = 创造模式。
+
+#### 当前值在 `agentPreset` 投影里，而且 view 是**裸字符串**
+
+这是它和本项目读过的**所有其他投影都不一样**的地方：
+
+```json
+// session/projections → values
+{ "agentPreset": "ptc" }
+```
+
+不是 `{"currentValue":"ptc"}` 那样的包装对象——`agentPresetProjectionDefinition` 声明的是
+`wire: { viewSchema: z.union([z.string(), z.null()]), view: (state) => state }`。
+**用 `optJSONObject` 读它会对每个会话都返回 null**，芯片就永远不出现。所以要按字符串读，
+并把它加进和 `tokenUsage` / `contextPressure` / `permissions` 同一份被监听的键集合里。
+
+#### `agentPresets/select`：参数形状与「已锁定」
+
+```json
+// POST /api/agentPresets/select  →  args
+{ "agentId": "session-…", "agentPreset": "ptc" }
+```
+
+两处是硬的：
+
+1. **`agentId` 是查找字段**（描述符里 `source: 'lookup'`, `lookup: 'agent'`,
+   `wire: 'agentId'`），会话 id 放这里，预设放 `agentPreset`。放错位置得到的是
+   `gateway/arguments-invalid`，不是选中了别的东西。
+2. **结果是裸字符串**。按 `z.string()` 声明，所以走「取 `value` 当对象」的通用解包会
+   把它**静默丢掉**（`optJSONObject("value")` 对 JSON 字符串是 null），调用方会拿到一个
+   空对象，分不清「切换成功」和「没有回答」。
+
+宿主在会话**开始第一轮之后**拒绝切换：
+
+```
+RemoteError("agent-preset/locked", "This session has already started")
+```
+
+这是刻意的规则，不是 bug：预设决定了模型**已经看到**的工具 schema 和提示词段落，
+中途换掉会让日志不诚实。客户端应当在点之前就说清楚，并把它翻译成用户能照做的一句话。
+
+#### 模式在 `session/create` 时指定
+
+```json
+// POST /api/session/create  →  args
+{ "request": { "workspaceId": "…", "agentPreset": "ptc" } }
+```
+
+一个**不带** `agentPreset` 的 create 会静默采用部署的默认值——一个没人做过的选择。
+所以「选择模式」这个动作是在**新建会话**时发生的，而不是事后切换；这也意味着模式芯片
+必须在**还没有会话**的时候就能用，而那正是 `agentPreset` 投影还空着的时候。
+
 ### `approval/request`：在手机上授权（1.1.9 起）
 
 和 `user-questions/request` 走**同一条** `$events` 流、**同一个** `waterfall` 帧形状、

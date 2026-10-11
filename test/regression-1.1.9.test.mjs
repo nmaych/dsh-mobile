@@ -560,9 +560,23 @@ check('the one-shot read and the live stream both carry the preset', () => {
   )
   assert.match(
     viewModel,
-    /val WATCHED_PROJECTIONS = setOf\("tokenUsage", "contextPressure", "permissions"\)/,
+    // 1.2.0 added `agentPreset` to the same set, for the same reason the other
+    // three are there: it is per-session state the host commits with its own event,
+    // so the chip has to follow the projection rather than the tap. The property
+    // this check guards — that the keys are named *once* rather than repeated at
+    // each call site — is unchanged, so it is asserted on the set as it now stands:
+    // every key is inside the one `setOf(...)` and none is spelled out elsewhere.
+    /val WATCHED_PROJECTIONS = setOf\([\s\S]*?\)/,
     'the watched keys must be named once, or the three call sites drift',
   )
+  const watched = /val WATCHED_PROJECTIONS = setOf\(([\s\S]*?)\)/.exec(viewModel)[1]
+  for (const key of ['tokenUsage', 'contextPressure', 'permissions']) {
+    assert.match(
+      watched,
+      new RegExp(`"${key}"`),
+      `${key} must still be a watched projection`,
+    )
+  }
 })
 
 check('the chip is offered only when it can change something', () => {

@@ -659,18 +659,35 @@ check('going up from the root is refused rather than guessed', () => {
   )
 })
 
-check('file text is shown verbatim rather than rendered as Markdown', () => {
-  // The user asked to see the file, so the source is the honest answer; a
-  // rendered view would hide exactly the syntax they opened it to check.
+check('file text is shown, with Markdown rendered as an extra view', () => {
+  // 1.1.7's rule was "the user asked to see the file, so the source is the honest
+  // answer". 1.2.0 kept that rule and added the case it did not cover: a `.md` file
+  // is usually opened to be *read*, and reading raw `#`/`**` syntax is not reading.
+  // So the source view stays — this check still requires it — and a rendered
+  // preview is offered *beside* it for Markdown only, which is the one way to
+  // satisfy both without hiding the syntax from someone who wants it.
   assert.match(
     filesDialog,
     /page\.text/,
     'the viewer must show the file text',
   )
-  assert.doesNotMatch(
-    functionBody(filesDialog, 'FileViewer'),
-    /Markdown\(/,
-    'the file viewer must not render Markdown: the source is what was asked for',
+  const body = functionBody(filesDialog, 'FileViewer')
+  // The source branch must survive: `Markdown(` may appear only *inside* the
+  // guarded preview branch, never as the only way the text is shown.
+  assert.match(
+    body,
+    /WorkspaceFiles\.isMarkdown\(/,
+    'the rendered view must be gated on the file actually being Markdown',
+  )
+  assert.match(
+    body,
+    /showSource/,
+    'and the source view must remain reachable, not be replaced by the preview',
+  )
+  assert.match(
+    body,
+    /Markdown\(page\.text/,
+    'the preview must render the same text through the shared Markdown renderer',
   )
 })
 

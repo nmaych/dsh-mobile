@@ -137,6 +137,7 @@ private fun DshRoot(
         onNewSession = vm::createSession,
         onOpenSession = vm::openSession,
         onRefresh = vm::refreshSessions,
+        onManualRefresh = vm::manualRefresh,
         onDismissError = vm::clearError,
         onBackendChange = vm::setBackend,
         onPair = vm::pair,
@@ -248,6 +249,12 @@ private fun DshRoot(
         onPickPermission = vm::selectPermissionPreset,
         onReloadPermissionPresets = vm::reloadPermissionPresets,
         onClosePermissionPicker = vm::closePermissionPicker,
+        onOpenAgentPresetPicker = vm::openAgentPresetPicker,
+        onPickAgentPreset = vm::selectAgentPreset,
+        onReloadAgentPresets = vm::reloadAgentPresets,
+        onCloseAgentPresetPicker = vm::closeAgentPresetPicker,
+        onOpenDeliverables = vm::openDeliverables,
+        onCloseDeliverables = vm::closeDeliverables,
         onToggleGroup = vm::toggleGroup,
     )
 }

@@ -255,7 +255,30 @@ class DshClient(private val prefs: Prefs) {
         namespace: String,
         method: String,
         args: JSONObject = JSONObject(),
-    ): JSONObject = withContext(Dispatchers.IO) {
+    ): JSONObject = rpcValue(origin, namespace, method, args) as? JSONObject ?: JSONObject()
+
+    /**
+     * Perform one unary Remote call, returning the result **value as sent**.
+     *
+     * The distinction from [rpc] matters for the handful of endpoints whose
+     * declared result is a *scalar* rather than an object. `agentPresets/select`
+     * answers with `z.string()` — the committed preset id — and
+     * `$events/result` answers with `'allowed-once' | 'rejected'`. Going through
+     * [rpc] loses those silently: `result.optJSONObject("value")` is null for a
+     * JSON string, so the caller receives an empty object and cannot tell a
+     * successful switch from a missing answer. It is the same class of bug as
+     * reading the `agentPreset` projection with `optJSONObject` when its view is a
+     * bare string.
+     *
+     * A JSON `null` value is reported as `null`, which is distinct from "the
+     * envelope was malformed" — that still throws.
+     */
+    suspend fun rpcValue(
+        origin: String,
+        namespace: String,
+        method: String,
+        args: JSONObject = JSONObject(),
+    ): Any? = withContext(Dispatchers.IO) {
         val base = origin.trim().trimEnd('/')
         val rpcId = UUID.randomUUID().toString()
         // `method` carries the full endpoint; the gateway rejects a bare method
@@ -284,7 +307,7 @@ class DshClient(private val prefs: Prefs) {
             if (!response.isSuccessful) {
                 throw DshException("HTTP ${response.code}: ${text.take(300)}", "http-${response.code}")
             }
-            parseResponse(text, rpcId)
+            parseResponseValue(text, rpcId)
         }
     }
 
@@ -351,7 +374,19 @@ class DshClient(private val prefs: Prefs) {
         }
     }
 
-    private fun parseResponse(text: String, expectedRpcId: String): JSONObject {
+    private fun parseResponse(text: String, expectedRpcId: String): JSONObject =
+        parseResponseValue(text, expectedRpcId) as? JSONObject ?: JSONObject()
+
+    /**
+     * Unwrap one response envelope, preserving whatever JSON type the value was.
+     *
+     * Split out from [parseResponse] so the two share the envelope and error
+     * handling exactly; only the treatment of the `value` differs. A JSON `null`
+     * value is returned as `null` rather than as an empty object, because the two
+     * mean different things to a caller — "the host cleared this" versus "the host
+     * said nothing" — and only the value's own type can tell them apart.
+     */
+    private fun parseResponseValue(text: String, expectedRpcId: String): Any? {
         val obj = runCatching { JSONObject(text) }
             .getOrElse { throw DshException("响应不是合法 JSON：${text.take(200)}", "bad-json") }
 
@@ -366,7 +401,10 @@ class DshClient(private val prefs: Prefs) {
             ?: throw DshException("响应缺少 result", "bad-envelope")
 
         if (result.optBoolean("ok", false)) {
-            return result.optJSONObject("value") ?: JSONObject()
+            // `opt` rather than `optJSONObject`: the value may legitimately be a
+            // string, a boolean or null, and coercing it here is what lost the
+            // scalar results in the first place.
+            return if (result.has("value")) result.opt("value") else null
         }
         val err = result.optJSONObject("error")
         val code = err?.optString("code") ?: "error"
@@ -771,8 +809,8 @@ class DshClient(private val prefs: Prefs) {
      * Create a session, optionally inside a workspace or an explicit directory.
      *
      * The descriptor accepts `workspaceId`, `cwd`, `sessionId` and
-     * `agentPreset`; only the first two are useful here, and sending an unknown
-     * key is rejected outright, so each is added only when it has a value.
+     * `agentPreset`; each is added only when it has a value, because sending an
+     * unknown key is rejected outright.
      *
      * **`workspaceId` and `cwd` are mutually exclusive.** The server rejects a
      * request carrying both with `gateway/bad-request`:
@@ -786,15 +824,23 @@ class DshClient(private val prefs: Prefs) {
      * to name; that keeps "create in this project" and "create in this directory"
      * as one call instead of two, and means a caller may pass both without
      * having to know which one the server prefers.
+     *
+     * `agentPreset` names the **mode** the new conversation runs in. It is sent
+     * only on create: a live session's mode is changed with
+     * [selectAgentPreset], and the server refuses a preset change once a session
+     * has started its first turn (`agent-preset/locked`), so passing it here is
+     * the only way to *choose* a mode rather than *change* one.
      */
     suspend fun createSession(
         origin: String,
         cwd: String? = null,
         workspaceId: String? = null,
+        agentPreset: String? = null,
     ): String {
         val req = JSONObject()
         if (!workspaceId.isNullOrBlank()) req.put("workspaceId", workspaceId)
         if (workspaceId.isNullOrBlank() && !cwd.isNullOrBlank()) req.put("cwd", cwd)
+        if (!agentPreset.isNullOrBlank()) req.put("agentPreset", agentPreset)
         val value = rpc(origin, "session", "create", JSONObject().put("request", req))
         return value.optString("sessionId").ifBlank {
             throw DshException("创建会话失败：服务器未返回 sessionId", "create-failed")
@@ -1088,6 +1134,19 @@ class DshClient(private val prefs: Prefs) {
          */
         val permissionPreset: String? = null,
         /**
+         * The session's active Agent preset (模式), when the host reports one.
+         *
+         * Read from the same `session/projections` response as the token figures,
+         * for the same reason as [permissionPreset]: it is one more value in the
+         * same `values` object, and a second round trip to read one string would be
+         * a second chance to fail.
+         *
+         * Note the shape differs from `permissions`: this projection's view is the
+         * id itself rather than an object wrapping it, so it is read with
+         * [AgentPresets.currentOf] rather than through a `{currentValue}` field.
+         */
+        val agentPreset: String? = null,
+        /**
          * The session log sequence these values were taken at.
          *
          * `session/projections` answers with `asOfSeq`, and the live
@@ -1152,6 +1211,10 @@ class DshClient(private val prefs: Prefs) {
             // here, so the one-shot path and the live `session/control` frames
             // cannot disagree about where the preset lives.
             permissionPreset = PermissionPresets.currentOf(value),
+            // Read through the shared reader for the same reason as the permission
+            // preset: the one-shot path and the live `session/control` frames must
+            // not disagree about where the value lives.
+            agentPreset = AgentPresets.currentOf(value),
             asOfSeq = value.optLong("asOfSeq", 0L),
         )
     }
@@ -1221,6 +1284,82 @@ class DshClient(private val prefs: Prefs) {
             )
         }
         return result.optString("text").takeIf { it.isNotBlank() }
+    }
+
+    // ---------------------------------------------------------- agent presets
+
+    /**
+     * The deployment's Agent presets — the modes a conversation can run in.
+     *
+     * `agentPresets/list` declares **no parameters**, so `args` must be empty:
+     * the gateway rejects a request whose keys do not match the descriptor. It is
+     * deployment-wide rather than per-session, so it is fetched once and reused.
+     *
+     * Note this is *not* the same namespace as [permissionCatalog]. The two are
+     * often confused because both are called "模式" in the UI, and they answer
+     * different questions: this one is which tools the agent gets, that one is
+     * what those tools are allowed to do.
+     */
+    suspend fun agentPresetRoster(origin: String): AgentPresets.Roster {
+        val value = rpc(origin, "agentPresets", "list")
+        return AgentPresets.rosterOf(value)
+    }
+
+    /**
+     * Switch a **blank** session's Agent preset.
+     *
+     * This is a real RPC — unlike the permission preset, which has to go through
+     * the plugin's `/permission` command — because `agentPresets/select` is
+     * declared with the agent scope and the preset as its two parameters.
+     *
+     * The first parameter is a **lookup**, not an ordinary value: the descriptor
+     * declares `source: 'lookup', lookup: 'agent'` with `wire: 'agentId'`, so the
+     * session id goes in `agentId` and the preset in `agentPreset`. Passing the
+     * session id as `agentPreset` (or omitting `agentId`) fails
+     * `gateway/arguments-invalid` rather than selecting anything.
+     *
+     * The host refuses the switch once the session has started its first turn —
+     * `RemoteError("agent-preset/locked", "This session has already started")` —
+     * which is a deliberate rule rather than a bug: the preset decides the tool
+     * schemas and prompt sections the model has already been shown, so changing it
+     * mid-conversation would make the log dishonest. The error is translated here
+     * into something a user can act on.
+     *
+     * @return the committed preset id, which is what the projection will report.
+     * @throws DshException when the session has started, or the preset is unknown.
+     */
+    suspend fun selectAgentPreset(
+        origin: String,
+        sessionId: String,
+        preset: String,
+    ): String {
+        val value = try {
+            rpcValue(
+                origin, "agentPresets", "select",
+                JSONObject()
+                    .put("agentId", sessionId)
+                    .put("agentPreset", preset),
+            )
+        } catch (t: DshException) {
+            // The host answers a started session with this code and an
+            // English-only message ("This session has already started") that names
+            // neither the session nor what to do about it. Rewritten here, once,
+            // rather than at every call site.
+            if (t.code == "agent-preset/locked") {
+                throw DshException(
+                    "这个会话已经开始了，模式只能在对话开始前选择。请新建一个会话。",
+                    t.code,
+                ).also { it.initCause(t) }
+            }
+            throw t
+        }
+        // The declared result is a bare string — the committed id — so it must be
+        // read as one. `rpc` would have dropped it (see [rpcValue]).
+        val committed = (value as? String)?.takeIf { it.isNotBlank() }
+        return committed ?: throw DshException(
+            "桌面端没有确认模式切换的结果。",
+            "agent-preset/no-result",
+        )
     }
 
     /**

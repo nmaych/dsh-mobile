@@ -32,6 +32,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandMore
@@ -42,6 +43,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -76,7 +78,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Message
+import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
+import ai.deepseek.dshmobile.ui.components.CopyMessageDialog
 import ai.deepseek.dshmobile.ui.components.MessageBubble
 import ai.deepseek.dshmobile.ui.components.ModelChip
 import ai.deepseek.dshmobile.ui.components.UsageChip
@@ -148,6 +152,8 @@ fun ChatScreen(
     onOpenModelPicker: () -> Unit,
     onOpenWorkspacePicker: () -> Unit,
     onOpenPermissionPicker: () -> Unit,
+    onOpenAgentPresetPicker: () -> Unit,
+    onOpenDeliverables: () -> Unit,
     onCopyMessage: (Message, (String) -> Unit) -> Unit,
     onOpenFile: (String) -> Unit,
 ) {
@@ -156,6 +162,12 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val bottomSlackPx = with(LocalDensity.current) { BOTTOM_SLACK.roundToPx() }
     val clipboard = LocalClipboardManager.current
+
+    // The long-press copy sheet. Held here rather than in the bubble so the sheet
+    // covers the transcript instead of being clipped to one row, and so exactly one
+    // can be open: a per-bubble state would let two sheets stack if the user
+    // long-pressed a second message while the first was open.
+    var copyTarget by remember { mutableStateOf<CopyTarget?>(null) }
 
     // The transcript is the durable log with each turn's steps reassembled into the
     // one response it was, plus the in-flight draft joined onto its own turn.
@@ -296,8 +308,35 @@ fun ChatScreen(
                         IconButton(onClick = onNewSession) {
                             Icon(Icons.Default.Add, contentDescription = "新建会话")
                         }
-                        IconButton(onClick = onRefresh) {
-                            Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                        // The refresh button was reported as doing nothing, and it
+                        // was: it only ever replaced the drawer's session list, which
+                        // is off-screen while the transcript is. It now re-syncs the
+                        // open conversation *and* reports itself — a spinner while it
+                        // runs, and a result line when it finishes. A control whose
+                        // only effect is invisible is indistinguishable from a dead
+                        // one, so the feedback is part of the fix rather than polish.
+                        IconButton(onClick = onRefresh, enabled = !state.refreshing) {
+                            if (state.refreshing) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                            }
+                        }
+                        // The files the assistant *delivered*, as opposed to the
+                        // workspace browser. Both exist because they answer different
+                        // questions — "what did it hand me?" versus "what is in this
+                        // project?" — and the chip on a tool card answers only the
+                        // first, one step at a time.
+                        if (state.deliverables.isNotEmpty()) {
+                            IconButton(onClick = onOpenDeliverables) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.InsertDriveFile,
+                                    contentDescription = "查看交付文件",
+                                )
+                            }
                         }
                     }
                     IconButton(onClick = onOpenSettings) {
@@ -337,6 +376,7 @@ fun ChatScreen(
                     onOpenModelPicker = onOpenModelPicker,
                     onOpenWorkspacePicker = onOpenWorkspacePicker,
                     onOpenPermissionPicker = onOpenPermissionPicker,
+                    onOpenAgentPresetPicker = onOpenAgentPresetPicker,
                 )
             }
 
@@ -354,8 +394,16 @@ fun ChatScreen(
                             MessageBubble(
                                 message = msg,
                                 onCopy = {
+                                    // The rendering happens in the view model (a
+                                    // message can be large, and building it on the
+                                    // main thread would drop frames during the tap),
+                                    // so the finished string arrives through this
+                                    // callback and is *shown* rather than pasted
+                                    // straight to the clipboard. See
+                                    // [CopyMessageDialog] for why the long press
+                                    // opens a sheet instead of copying.
                                     onCopyMessage(msg) { text ->
-                                        clipboard.setText(AnnotatedString(text))
+                                        copyTarget = CopyTarget(text, copySubtitle(msg))
                                     }
                                 },
                                 // Null in API mode: there is no workspace behind a
@@ -393,6 +441,45 @@ fun ChatScreen(
             }
         }
     }
+
+    // The long-press copy sheet, composed outside the `Scaffold` so it is not
+    // clipped by the transcript's bounds and sits above the input bar.
+    copyTarget?.let { target ->
+        CopyMessageDialog(
+            text = target.text,
+            subtitle = target.subtitle,
+            onCopyAll = {
+                clipboard.setText(AnnotatedString(target.text))
+                copyTarget = null
+            },
+            onDismiss = { copyTarget = null },
+        )
+    }
+}
+
+/**
+ * One pending copy sheet: the rendered body and what to call it.
+ *
+ * A plain holder rather than two `mutableStateOf`s, so the sheet cannot be
+ * composed with a body from one message and a subtitle from another — which two
+ * independent slots would allow the moment a second long press landed while the
+ * first sheet was open.
+ */
+private data class CopyTarget(val text: String, val subtitle: String)
+
+/**
+ * What to call the message being copied, in the sheet's subtitle.
+ *
+ * The dialog covers the transcript, so the user cannot see which bubble they
+ * pressed; naming the speaker is what keeps "did I copy mine or its answer?"
+ * answerable. It reuses the same labels the transcript export uses
+ * ([Transcript.roleLabel] via the Markdown), so the two cannot disagree.
+ */
+private fun copySubtitle(message: Message): String = when (message.role) {
+    Role.USER -> "你的消息"
+    Role.ASSISTANT -> "助手的回复"
+    Role.CONTEXT -> "上下文材料"
+    Role.SYSTEM, Role.TOOL -> "系统消息"
 }
 
 /**
@@ -431,6 +518,7 @@ private fun RemoteChipsRow(
     onOpenModelPicker: () -> Unit,
     onOpenWorkspacePicker: () -> Unit,
     onOpenPermissionPicker: () -> Unit,
+    onOpenAgentPresetPicker: () -> Unit,
 ) {
     val workspace = state.workspaces.firstOrNull { it.id == state.selectedWorkspaceId }
     FlowRow(
@@ -441,6 +529,32 @@ private fun RemoteChipsRow(
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // The mode is the *first* chip because it is the one decision that cannot
+        // be revised: the host locks a session's preset once its first turn starts
+        // (`agent-preset/locked`), because the preset decides the tool schemas and
+        // prompt sections the model has already been shown. Sitting before the model
+        // chip reflects that — it is chosen, not switched.
+        //
+        // Offered whenever the host lists modes at all, including with no session
+        // open: a mode is named at *create* time, so the chip has to be usable
+        // before a conversation exists, which is exactly when
+        // `activeAgentPreset` is still blank.
+        if (state.agentPresetSwitchable) {
+            AgentPresetChip(
+                label = state.activeAgentPresetRow?.label
+                    ?: state.selectedAgentPresetRow?.label
+                    ?: "选择模式",
+                // The active session's mode once it has one; the pending choice for
+                // the next session otherwise. The distinction is shown rather than
+                // hidden, because "which mode will my next message use?" is the
+                // question this chip answers.
+                pending = state.activeAgentPreset.isBlank(),
+                locked = state.agentPresetLocked,
+                enabled = state.connected && !state.switchingAgentPreset,
+                onClick = onOpenAgentPresetPicker,
+                modifier = Modifier.align(Alignment.CenterVertically),
+            )
+        }
         ModelChip(
             // Never stand in a catalog entry for the active model: before a turn
             // reports one, or before the user picks one, no model is in effect
@@ -519,6 +633,84 @@ private fun RemoteChipsRow(
                 // Material3 does *not* pad out to 48dp. It has to be centred
                 // explicitly or it sits above its neighbours in landscape.
                 modifier = Modifier.align(Alignment.CenterVertically),
+            )
+        }
+    }
+}
+
+/**
+ * The Agent-preset (模式) chip.
+ *
+ * ## Why it is a chip on this strip
+ *
+ * The mode decides which tools the agent is handed and how it is told to work, so
+ * it is one of the facts a turn depends on — the same kind of thing as the model
+ * and the workspace beside it. Before this the only way to change it was on the
+ * desktop, and a phone user had no way even to *see* which mode a conversation was
+ * running in.
+ *
+ * ## Why it is marked differently from the other chips
+ *
+ * Two states are shown rather than smoothed over, because both change what the
+ * next message will do:
+ *
+ *  - **Pending** — no session is open yet, so the chip names the mode the *next*
+ *    conversation will be created in. Drawn with the primary tint, because it is a
+ *    choice that has not taken effect.
+ *  - **Locked** — the session has started, so the host will refuse a change. Drawn
+ *    dimmed with a lock, and still tappable: the tap explains the rule and offers
+ *    to remember the choice for the next conversation, which is more useful than a
+ *    control that silently does nothing.
+ */
+@Composable
+private fun AgentPresetChip(
+    label: String,
+    pending: Boolean,
+    locked: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val accent = when {
+        locked -> MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.primary
+    }
+    Surface(
+        onClick = onClick,
+        enabled = enabled,
+        color = if (pending && !locked) {
+            MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+        },
+        shape = RoundedCornerShape(6.dp),
+        modifier = modifier.wrapContentHeight(),
+    ) {
+        Row(
+            Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                if (locked) Icons.Default.Lock else Icons.Default.Tune,
+                contentDescription = null,
+                modifier = Modifier.size(10.dp),
+                tint = accent,
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                label,
+                fontSize = 9.5.sp,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.widthIn(max = 110.dp),
+            )
+            Icon(
+                Icons.Default.ExpandMore,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }

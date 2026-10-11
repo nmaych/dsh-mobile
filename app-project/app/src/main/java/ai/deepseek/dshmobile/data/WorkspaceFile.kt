@@ -135,4 +135,34 @@ object WorkspaceFiles {
         val base = directory.trim().replace('\\', '/').trim('/')
         return if (base.isEmpty()) name else "$base/$name"
     }
+
+    /**
+     * The file's lower-case extension without its dot, or empty when it has none.
+     *
+     * Reads only the final path segment, so a directory with a dot in its name
+     * ("notes.v2/readme") does not contribute its own suffix, and a dotfile
+     * (".gitignore") reports no extension rather than "gitignore" — the latter is
+     * the common bug, and it would make `.gitignore` render as Markdown if
+     * "gitignore" ever appeared in [MARKDOWN_EXTENSIONS].
+     */
+    fun extensionOf(path: String): String {
+        val name = path.replace('\\', '/').trimEnd('/').substringAfterLast('/')
+        val dot = name.lastIndexOf('.')
+        // `dot <= 0` covers both "no dot" and "leading dot", which is a dotfile
+        // rather than an extension.
+        if (dot <= 0 || dot == name.length - 1) return ""
+        return name.substring(dot + 1).lowercase()
+    }
+
+    /**
+     * True when this file should be offered a rendered Markdown view.
+     *
+     * Only the Markdown family. Rendering is an *extra* view rather than a
+     * replacement — see the viewer — so this list can stay narrow without costing
+     * the user anything: a file that is not here still opens, as source.
+     */
+    fun isMarkdown(path: String): Boolean = extensionOf(path) in MARKDOWN_EXTENSIONS
+
+    /** The extensions the Markdown renderer is offered for. */
+    private val MARKDOWN_EXTENSIONS = setOf("md", "markdown", "mdown", "mkd", "mdx")
 }

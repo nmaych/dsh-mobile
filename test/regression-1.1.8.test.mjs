@@ -156,22 +156,52 @@ check('the gesture is optional and left off system notices', () => {
   }
 })
 
-check('the transcript wires the long press to the clipboard', () => {
+check('the transcript wires the long press to the copy action', () => {
   assert.match(
     chatScreen,
     /onCopyMessage/,
     'the transcript screen must accept a per-message copy action',
   )
   const list = chatScreen.slice(chatScreen.indexOf('items(rendered'))
+  const firstBubble = list.slice(0, 1200)
   assert.match(
-    list.slice(0, 400),
+    firstBubble,
     /onCopy\s*=/,
     'each bubble must be given the copy handler',
   )
+  // 1.1.8 wrote the text straight to the clipboard here. 1.2.0 changed what the
+  // long press *does* — the report was 「复制内容，我要的是长按对话框选择内容复制」, a
+  // dialog in which the content can be selected — so the handler now opens that
+  // dialog and the clipboard write moved to its "复制全部" button. The requirement
+  // this check was written for is unchanged and still asserted: the press must lead
+  // to a real clipboard write, not to a callback that goes nowhere. It is now
+  // asserted one step further along, on the sheet that owns the write.
   assert.match(
-    list.slice(0, 400),
+    firstBubble,
+    /copyTarget\s*=/,
+    'the long press must open the copy sheet that 1.2.0 introduced',
+  )
+  assert.match(
+    chatScreen,
     /clipboard\.setText/,
-    'the handler must place the text on the real clipboard',
+    'the text must still reach the real clipboard, now from the sheet',
+  )
+  assert.match(
+    chatScreen,
+    /CopyMessageDialog\(/,
+    'the sheet must be a selectable dialog, which is what the report asked for',
+  )
+  // The selection container lives in the sheet itself, not at the call site.
+  const copyDialog = src('ui/components/CopyMessageDialog.kt')
+  assert.match(
+    copyDialog,
+    /SelectionContainer/,
+    'and its body must be selectable, or it is not the dialog that was asked for',
+  )
+  assert.match(
+    copyDialog,
+    /heightIn\(max = 420\.dp\)[\s\S]{0,120}?verticalScroll/,
+    'the body must scroll inside a bounded height, or a long reply overflows the sheet',
   )
 })
 

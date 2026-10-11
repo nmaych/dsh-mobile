@@ -439,19 +439,63 @@ check('a single activateSession path owns every session switch', () => {
   //
   // The call now carries the address as well as the id: a subagent child cannot
   // be followed by id, so the address travels with the switch.
-  const calls = viewModel.match(/startFollowing\(sessionId,\s*address\)/g) ?? []
-  assert.equal(
-    calls.length,
-    1,
-    `startFollowing must be invoked from exactly one place (activateSession); ` +
-      `found ${calls.length} call sites`,
-  )
+  //
+  // 1.2.0 added a *second* caller — `restartFollowing`, the app-bar refresh's
+  // re-arm — and the invariant has to be stated more precisely to keep meaning
+  // anything. What matters is not "there is one call" but "a session *switch*
+  // resets the per-session state, and nothing else does":
+  //
+  //  - `activateSession` is the switch, and it must clear `seenSeqs`/`callIndex`
+  //    before subscribing, or the new session's events look like replays.
+  //  - `restartFollowing` is a re-arm of the *same* session. It must NOT clear
+  //    them: the replayed backlog is deduped by `seenSeqs`, and clearing it would
+  //    rebuild the transcript and lose the uncommitted local echoes. So the two
+  //    callers are asserted separately, by which function they sit in.
   const activate = functionBody(viewModel, 'activateSession')
   assert.ok(
     activate.includes('startFollowing(sessionId, address)'),
-    'the one startFollowing call must live inside activateSession',
+    'activateSession must start the follow subscription',
   )
-  // And every session switch must go through it.
+  assert.ok(
+    /seenSeqs\.clear\(\)/.test(activate) && /callIndex\.clear\(\)/.test(activate),
+    'a session switch must reset the dedupe and call-index state before following',
+  )
+
+  // Every call site of `startFollowing` must be one of the two known owners.
+  //
+  // `\b` matters: `restartFollowing(` *contains* `startFollowing(`, so a bare
+  // pattern counts the re-arm twice and reports a call site that does not exist.
+  const calls = viewModel.match(/(?<![A-Za-z])startFollowing\(/g) ?? []
+  const declarationAt = viewModel.indexOf('private fun startFollowing(')
+  assert.ok(declarationAt >= 0, 'startFollowing must exist')
+  const callSites = calls.length - 1
+  assert.equal(
+    callSites,
+    2,
+    `startFollowing must be called from exactly two places — activateSession ` +
+      `(a switch) and restartFollowing (a re-arm); found ${callSites}`,
+  )
+
+  const restart = functionBody(viewModel, 'restartFollowing')
+  assert.match(
+    restart,
+    /startFollowing\(sessionId,\s*address\)/,
+    'restartFollowing must re-arm the subscription for the same address',
+  )
+  // Comments are stripped before the negative check: the function's own KDoc
+  // explains *why* it must not clear these, and naming them there would otherwise
+  // trip the assertion that forbids clearing them.
+  const restartCode = restart
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n')
+  assert.doesNotMatch(
+    restartCode,
+    /seenSeqs\.clear\(\)|callIndex\.clear\(\)/,
+    'a re-arm must keep the dedupe state: clearing it would rebuild the ' +
+      'transcript and discard the replayed backlog dedupe the re-arm relies on',
+  )
+  // And every session switch must go through activateSession.
   const activations = viewModel.match(/activateSession\(/g) ?? []
   assert.ok(
     activations.length >= 3,

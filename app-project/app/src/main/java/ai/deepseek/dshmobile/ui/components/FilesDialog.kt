@@ -4,6 +4,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,6 +29,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -37,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import ai.deepseek.dshmobile.data.WorkspaceFileEntry
 import ai.deepseek.dshmobile.data.WorkspaceFilePage
+import ai.deepseek.dshmobile.data.WorkspaceFiles
 import ai.deepseek.dshmobile.data.WorkspaceListing
 
 /**
@@ -105,7 +111,7 @@ fun FilesDialog(
                     .verticalScroll(rememberScrollState()),
             ) {
                 when {
-                    openFile != null -> FileViewer(openFile)
+                    openFile != null -> FileViewer(openFile, openFilePath)
 
                     loading && listing == null -> Box(
                         Modifier
@@ -237,16 +243,38 @@ private fun FileRow(entry: WorkspaceFileEntry, onClick: () -> Unit) {
 }
 
 /**
- * A read-only view of one text file.
+ * A read-only view of one text file, with a rendered Markdown preview when the
+ * file is Markdown.
  *
- * Monospace and not re-wrapped: this is a file, and honouring its own line breaks
- * is the point. Markdown is deliberately *not* rendered here even though the
- * transcript renders it — the user asked to see the file, so showing the source
- * is the honest answer, and a rendered view would hide exactly the syntax they
- * opened it to check.
+ * ## Why the source view is still there
+ *
+ * 1.1.7 rendered every file as source, deliberately: "the user asked to see the
+ * file, so showing the source is the honest answer, and a rendered view would hide
+ * exactly the syntax they opened it to check". That reasoning is sound, and it is
+ * why the source view is *kept* — but it is only half the job for a Markdown file.
+ * A `.md` file is usually opened to be **read** (a report the assistant just wrote,
+ * a README, a plan), and reading raw `#`/`**`/`|` syntax is not reading.
+ *
+ * So both are offered, and which one leads is decided by the file rather than by a
+ * global preference:
+ *
+ *  - **Markdown leads with the rendered preview.** That is what the file *is* — the
+ *    syntax is an encoding of the document, not the document — and it is the view
+ *    that makes the assistant's delivered `.md` actually useful on a phone.
+ *  - **Every other file is source only**, and the toggle is not drawn at all. A
+ *    switch that has one position is a control that lies about having a choice.
+ *  - **The toggle is always available for Markdown**, so the old guarantee holds:
+ *    the syntax is one tap away rather than unreachable.
+ *
+ * The preview is rendered through the same [Markdown] composable the transcript
+ * uses, so a `.md` file and a message that quotes it cannot render differently.
  */
 @Composable
-private fun FileViewer(page: WorkspaceFilePage) {
+private fun FileViewer(page: WorkspaceFilePage, path: String) {
+    val isMarkdown = WorkspaceFiles.isMarkdown(path)
+    // Defaults to the preview for Markdown and to source otherwise, and is keyed to
+    // the path so switching files does not carry the previous file's choice over.
+    var showSource by remember(path) { mutableStateOf(!isMarkdown) }
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -259,6 +287,20 @@ private fun FileViewer(page: WorkspaceFilePage) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
+            if (isMarkdown) {
+                // A plain text toggle rather than a `Switch`: it is a two-state
+                // choice between two named views, and naming them is clearer than an
+                // unlabelled on/off.
+                TextButton(
+                    onClick = { showSource = !showSource },
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                ) {
+                    Text(
+                        if (showSource) "预览 Markdown" else "查看源码",
+                        fontSize = 11.sp,
+                    )
+                }
+            }
             page.bytes?.let {
                 Text(
                     formatBytes(it),
@@ -274,17 +316,30 @@ private fun FileViewer(page: WorkspaceFilePage) {
             shape = RoundedCornerShape(8.dp),
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text(
-                page.text.ifEmpty { "（空文件）" },
-                fontSize = 11.sp,
-                fontFamily = FontFamily.Monospace,
-                lineHeight = 16.sp,
-                modifier = Modifier.padding(10.dp),
-            )
+            if (isMarkdown && !showSource) {
+                // Rendered, so it is padded rather than monospaced: the Markdown
+                // composable draws its own blocks (headings, code, quotes) and a
+                // surrounding monospace style would fight it.
+                Box(Modifier.padding(10.dp)) {
+                    Markdown(page.text.ifEmpty { "（空文件）" })
+                }
+            } else {
+                Text(
+                    page.text.ifEmpty { "（空文件）" },
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    lineHeight = 16.sp,
+                    modifier = Modifier.padding(10.dp),
+                )
+            }
         }
         if (!page.eof) {
             Spacer(Modifier.height(6.dp))
             Text(
+                // A partial page cannot be rendered as a document — the Markdown
+                // composable would show an unterminated code fence as literal text —
+                // so the truncation is stated, and the preview is still offered
+                // because the beginning of a document is usually the part being read.
                 "文件较长，这里只显示开头部分。",
                 fontSize = 10.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,

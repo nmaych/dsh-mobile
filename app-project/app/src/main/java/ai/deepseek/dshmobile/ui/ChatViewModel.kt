@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import ai.deepseek.dshmobile.DshApp
+import ai.deepseek.dshmobile.data.AgentPresets
 import ai.deepseek.dshmobile.data.ApprovalRequest
 import ai.deepseek.dshmobile.data.Backend
 import ai.deepseek.dshmobile.data.Block
@@ -18,6 +19,7 @@ import ai.deepseek.dshmobile.data.QuestionAnswer
 import ai.deepseek.dshmobile.data.Role
 import ai.deepseek.dshmobile.data.SessionParser
 import ai.deepseek.dshmobile.data.TokenUsage
+import ai.deepseek.dshmobile.data.ToolFiles
 import ai.deepseek.dshmobile.data.Transcript
 import ai.deepseek.dshmobile.data.UserQuestion
 import ai.deepseek.dshmobile.data.WorkspaceFilePage
@@ -212,6 +214,28 @@ data class ChatUiState(
     val switchingPermission: Boolean = false,
     /** True while the permission picker is on screen. */
     val showPermissionPicker: Boolean = false,
+    /** True while a manual refresh is in flight, so the button can show it. */
+    val refreshing: Boolean = false,
+    // ---- agent presets (模式) ----------------------------------------------
+    /**
+     * The deployment's Agent presets, from `agentPresets/list`.
+     *
+     * Empty until loaded, and stays empty on a host without the preset registry —
+     * which is what hides the mode chip rather than offering a switch that cannot
+     * work. Distinct from [permissionPresets]: that one is policy, this one is
+     * which tools and working style the agent gets.
+     */
+    val agentPresets: List<AgentPresets.Preset> = emptyList(),
+    /** The preset the active session runs, or blank when the host does not say. */
+    val activeAgentPreset: String = "",
+    /** The mode a *new* session will be created in. */
+    val selectedAgentPreset: String = "",
+    /** True while the preset roster is being fetched. */
+    val loadingAgentPresets: Boolean = false,
+    /** True while a preset switch is in flight. */
+    val switchingAgentPreset: Boolean = false,
+    /** True while the preset picker is on screen. */
+    val showAgentPresetPicker: Boolean = false,
     // ---- workspace files ---------------------------------------------------
     /**
      * The directory listing currently on screen, or null when the browser is shut.
@@ -231,6 +255,17 @@ data class ChatUiState(
     val openFilePath: String = "",
     /** Why the browser is showing an error instead of entries. */
     val filesError: String? = null,
+    // ---- delivered files ---------------------------------------------------
+    /**
+     * True while the "delivered files" sheet is on screen.
+     *
+     * A flag rather than the list itself, because the list is *derived* from the
+     * transcript — see [deliverables]. Storing it would be a second copy that can
+     * disagree with the messages it was read from, and the disagreement would show
+     * up as a sheet that stops updating while the turn that produces the file is
+     * still running.
+     */
+    val showDeliverables: Boolean = false,
     /**
      * The workspace groups currently expanded in the drawer.
      *
@@ -269,6 +304,66 @@ data class ChatUiState(
     val permissionSwitchable: Boolean
         get() = permissionPresets.isNotEmpty() && activePermissionPreset.isNotBlank()
 
+    /**
+     * The active session's mode, as a row the UI can name.
+     *
+     * Falls back to a row built from the raw id so a preset the roster does not
+     * list — a declaration that changed under us, or a host that reports a mode
+     * without listing it — still reads as *something* rather than as a blank chip.
+     * The shipped four resolve through [AgentPresets.builtInName], so a session in
+     * `standard` shows 「标准模式」 even before the roster has loaded.
+     */
+    val activeAgentPresetRow: AgentPresets.Preset?
+        get() {
+            val id = activeAgentPreset
+            if (id.isBlank()) return null
+            return agentPresets.firstOrNull { it.id == id }
+                ?: AgentPresets.Preset(
+                    id = id,
+                    name = AgentPresets.builtInName(id).orEmpty(),
+                    description = AgentPresets.builtInDescription(id).orEmpty(),
+                )
+        }
+
+    /** The mode a new session will start in, as a row the UI can name. */
+    val selectedAgentPresetRow: AgentPresets.Preset?
+        get() {
+            val id = selectedAgentPreset
+            if (id.isBlank()) return null
+            return agentPresets.firstOrNull { it.id == id }
+                ?: AgentPresets.Preset(
+                    id = id,
+                    name = AgentPresets.builtInName(id).orEmpty(),
+                    description = AgentPresets.builtInDescription(id).orEmpty(),
+                )
+        }
+
+    /**
+     * True when the mode chip should be offered.
+     *
+     * The roster has to be non-empty — a host without the registry has no modes to
+     * offer, and a chip that cannot change anything is a control that lies. Unlike
+     * the permission chip this does *not* also require a value on the active
+     * session: the mode is chosen when a session is **created**, so it has to be
+     * selectable *before* one exists, which is exactly when
+     * [activeAgentPreset] is still blank.
+     */
+    val agentPresetSwitchable: Boolean
+        get() = agentPresets.isNotEmpty()
+
+    /**
+     * True when the active session's mode can still be changed.
+     *
+     * The host refuses a switch once the first turn has started
+     * (`agent-preset/locked`) because the preset decides the tool schemas and
+     * prompt sections the model has already been shown. The picker says so up
+     * front rather than letting the user tap and be refused: a session that has
+     * produced any transcript row has started, and `running` covers the window
+     * between the first token and the first durable event.
+     */
+    val agentPresetLocked: Boolean
+        get() = activeSessionId != null && (running || messages.isNotEmpty())
+
     /** What the usage chip renders: settled totals plus the in-flight attempt. */
     val displayUsage: TokenUsage get() = usage + liveUsage
 
@@ -293,6 +388,29 @@ data class ChatUiState(
      * appeared, and the tap looked dead.
      */
     val filesOpen: Boolean get() = files != null || filesError != null || openFile != null
+
+    /**
+     * The files the assistant delivered, newest first.
+     *
+     * Derived from the transcript rather than stored, and that is the point: the
+     * transcript is *live*. A snapshot taken when the sheet was opened would stop
+     * updating the moment a turn produced another file — and the moment a turn is
+     * producing files is exactly when the user is watching.
+     *
+     * ## Why it is a `lazy` and not a plain `get()`
+     *
+     * The app bar reads it on **every recomposition**, and a token delta recomposes
+     * the whole shell — many times a second on a streaming turn. A plain getter
+     * would walk every message and every block of a long conversation that often,
+     * on the main thread, to answer one `isNotEmpty()`.
+     *
+     * A `lazy` is correct here rather than a cache that can go stale: `messages` is
+     * a `val`, and every update goes through `copy()`, which produces a **new
+     * instance** with its own uninitialised delegate. So the value can never
+     * outlive the messages it was computed from — which is exactly the property a
+     * stored field in the view model would not have.
+     */
+    val deliverables: List<ToolFiles.Ref> by lazy { ToolFiles.delivered(messages) }
 }
 
 /**
@@ -381,6 +499,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             viaGateway = prefs.usesGateway,
             selectedWorkspaceId = prefs.workspaceId,
             activeEffort = prefs.reasoningEffort,
+            // Seeded from the stored preference so a create that races the roster
+            // fetch still names the mode the user last chose. The roster, when it
+            // arrives, validates it and falls back to the host's own default if the
+            // deployment no longer declares it.
+            selectedAgentPreset = prefs.agentPreset,
         )
         // Retract a transport error the moment the mux comes back, and never let a
         // stale "disconnected" outlive a working connection.
@@ -496,6 +619,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         if (backend == Backend.REMOTE) {
             refreshSessions()
             refreshWorkspaces()
+            // The mode roster is deployment-wide and read once, so it is fetched
+            // alongside the other two. Without it the mode chip stays hidden and a
+            // user who switched to the API backend and back would lose the ability
+            // to pick a mode until the app restarted.
+            loadAgentPresets()
             // Switching *into* remote mode is a fifth way to end up connected, and
             // it needs the same subscription as the other four. Launching the app
             // in API mode means `autoConnect` returned before subscribing, so
@@ -564,6 +692,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 refreshSessions()
                 refreshWorkspaces()
+                loadAgentPresets()
                 // Subscribe to the host's forwarded events. Without this the
                 // pairing *succeeds* and every other call works, but
                 // `ask_user_question` has no channel at all: the question is
@@ -736,6 +865,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // outlive it — the chip would name a mode the new session is not in.
             activePermissionPreset = "",
             showPermissionPicker = false,
+            // And neither must the mode, for the same reason. The remembered
+            // next-session choice is a preference and stays.
+            activeAgentPreset = "",
+            showAgentPresetPicker = false,
         )
     }
 
@@ -841,6 +974,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) {
                 refreshSessions()
                 refreshWorkspaces()
+                loadAgentPresets()
                 // Only worth subscribing once the credential is known good; the
                 // stream is admitted by the same fence as every other `/api` call.
                 startEvents()
@@ -889,6 +1023,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             if (ok) {
                 refreshSessions()
                 refreshWorkspaces()
+                loadAgentPresets()
                 startEvents()
                 if (reopen != null) activateSession(reopen, reopenTitle.ifBlank { "会话" }, false)
             }
@@ -897,6 +1032,35 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- sessions
 
+    /**
+     * Reload the session list, and re-sync the conversation the user is reading.
+     *
+     * ## Why the button looked dead
+     *
+     * The refresh button called exactly this method, and this method only ever
+     * replaced `sessions` — the *drawer's* list. A user who tapped it while
+     * looking at a transcript saw the same transcript, the same title and the same
+     * chips, because nothing they could see had been re-read. The one thing it did
+     * change was the drawer, which is closed while the transcript is on screen.
+     * There was no spinner, no toast and no timestamp either, so even the case it
+     * did handle was indistinguishable from a dead button.
+     *
+     * Three things fix that, and all three are needed:
+     *
+     *  1. **The open session is re-synced too.** `session/follow` already replays
+     *     its backlog, so the cheapest honest re-sync is to re-arm that
+     *     subscription — the transcript then catches up on anything the phone
+     *     missed, which is the actual reason to press refresh on a phone whose
+     *     socket has been asleep. See [restartFollowing].
+     *  2. **`refreshing` is set**, so the app bar can show that something happened.
+     *  3. **An `info` line reports the outcome**, including the count, so a
+     *     successful refresh is visibly a refresh rather than a no-op.
+     *
+     * `refreshSessions` is still called by the automatic paths (drawer open,
+     * reconnect, after a send), and those must not flash a spinner or a toast at
+     * the user. So the *feedback* is owned by [manualRefresh], which is what the
+     * button is wired to, and this method stays the quiet primitive.
+     */
     fun refreshSessions() {
         val origin = prefs.serverUrl
         if (origin.isBlank()) return
@@ -907,30 +1071,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val requestedFor = _state.value.activeSessionId
         viewModelScope.launch {
             try {
-                val list = dsh.listSessions(origin)
-                val stillOnRequested = _state.value.activeSessionId == requestedFor
-                val active = list.firstOrNull { it.id == requestedFor }
-                _state.value = _state.value.copy(
-                    sessions = list.map {
-                        SessionRow(
-                            it.id, it.title, it.updatedAt, it.cwd, it.running, it.model,
-                            subagent = it.subagent,
-                        )
-                    },
-                    connected = true,
-                    activeModel = if (stillOnRequested) {
-                        active?.model?.takeIf { it.isNotBlank() } ?: _state.value.activeModel
-                    } else {
-                        _state.value.activeModel
-                    },
-                    activeWorkspaceId = if (stillOnRequested) {
-                        active?.cwd
-                            ?.let { cwd -> _state.value.workspaces.firstOrNull { it.path == cwd }?.id }
-                            .orEmpty()
-                    } else {
-                        _state.value.activeWorkspaceId
-                    },
-                )
+                applySessionList(dsh.listSessions(origin), requestedFor)
             } catch (t: Throwable) {
                 // A failed *list* call is not evidence that the desktop is gone,
                 // and it must not be reported as though it were.
@@ -961,6 +1102,122 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
+    }
+
+    /**
+     * Fold a freshly read session list into the state.
+     *
+     * Shared by the quiet path and the manual refresh so the two cannot disagree
+     * about what a list means — the same reason `refreshUsage` and the control
+     * stream share their projection reader.
+     *
+     * @param requestedFor the session that was active when the read *started*.
+     *   Only a response still describing that session may stamp the model and
+     *   workspace chips: a slow reply that lands after the user switched would
+     *   otherwise write the old session's facts onto the new one's chips. The list
+     *   itself is applied either way, because it is not specific to any session.
+     */
+    private fun applySessionList(list: List<DshClient.SessionInfo>, requestedFor: String?) {
+        val stillOnRequested = _state.value.activeSessionId == requestedFor
+        val active = list.firstOrNull { it.id == requestedFor }
+        _state.value = _state.value.copy(
+            sessions = list.map {
+                SessionRow(
+                    it.id, it.title, it.updatedAt, it.cwd, it.running, it.model,
+                    subagent = it.subagent,
+                )
+            },
+            connected = true,
+            activeModel = if (stillOnRequested) {
+                active?.model?.takeIf { it.isNotBlank() } ?: _state.value.activeModel
+            } else {
+                _state.value.activeModel
+            },
+            activeWorkspaceId = if (stillOnRequested) {
+                active?.cwd
+                    ?.let { cwd -> _state.value.workspaces.firstOrNull { it.path == cwd }?.id }
+                    .orEmpty()
+            } else {
+                _state.value.activeWorkspaceId
+            },
+        )
+    }
+
+    /**
+     * The app-bar refresh: reload the list, re-sync the transcript, and say so.
+     *
+     * Kept separate from [refreshSessions] because the automatic callers must stay
+     * silent. This is the one the button is wired to.
+     *
+     * The re-sync is a re-arm of the follow subscription rather than a second
+     * `session/follow` stream: opening a competing stream would leave two
+     * collectors folding the same events into the same transcript, and the one
+     * that lost the race would re-add everything the other had already applied.
+     * `restartFollowing` cancels the existing job first, so exactly one is ever
+     * live.
+     */
+    fun manualRefresh() {
+        val origin = prefs.serverUrl
+        if (origin.isBlank()) {
+            _state.value = _state.value.copy(error = "尚未配置桌面端地址，无法刷新。")
+            return
+        }
+        if (_state.value.refreshing) return
+        val requestedFor = _state.value.activeSessionId
+        viewModelScope.launch {
+            _state.value = _state.value.copy(refreshing = true, error = null, info = null)
+            // Re-arm the transcript's subscription first: this is the half the
+            // button was missing, and it is the half a user actually watches.
+            restartFollowing()
+            try {
+                val list = dsh.listSessions(origin)
+                applySessionList(list, requestedFor)
+                _state.value = _state.value.copy(
+                    refreshing = false,
+                    info = "已刷新 · ${list.size} 个会话",
+                )
+                // The chips and the roster are the other two things a refresh should
+                // bring up to date; both are deployment-wide and cheap, and neither
+                // reports an error of its own (they set their own loading flags).
+                refreshWorkspaces()
+                loadAgentPresets()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                val transport = isTransportError(t)
+                _state.value = _state.value.copy(
+                    refreshing = false,
+                    // Reported even when a live socket would normally suppress it:
+                    // this failure is the *direct answer* to a button the user just
+                    // pressed, and silence there is exactly the "按钮没反应"
+                    // complaint. The wording says the refresh failed rather than
+                    // claiming the desktop is unreachable.
+                    error = "刷新失败：${t.message ?: "无法获取会话列表"}",
+                    errorIsTransport = transport,
+                )
+            }
+        }
+    }
+
+    /**
+     * Re-arm the active session's follow subscription, keeping the transcript.
+     *
+     * The job is cancelled and a fresh one started against the same address. The
+     * transcript, `seenSeqs` and `callIndex` are deliberately **not** cleared: the
+     * new subscription replays the backlog, and the dedupe set is what makes that
+     * replay a no-op for events already folded. Clearing them would rebuild the
+     * transcript from scratch — a visible flicker, and a loss of the optimistic
+     * echoes that have not been committed yet.
+     *
+     * A no-op without an active session, which is why it is safe to call
+     * unconditionally from a refresh.
+     */
+    private fun restartFollowing() {
+        val sessionId = _state.value.activeSessionId ?: return
+        val address = _state.value.activeAddress ?: return
+        followJob?.cancel()
+        followJob = null
+        startFollowing(sessionId, address)
     }
 
     fun openSession(sessionId: String) {
@@ -1025,6 +1282,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             // over would name a mode the new conversation is not in.
             activePermissionPreset = "",
             showPermissionPicker = false,
+            // Same reasoning as the permission preset: the mode belongs to the
+            // session. The *selected* (next-session) mode deliberately survives —
+            // it is a user preference, not session state.
+            activeAgentPreset = "",
+            showAgentPresetPicker = false,
             // The file browser is rooted at the *previous* session's workspace, so
             // its listing describes a directory the new session may not even be
             // able to see. Closing it is the only honest option: keeping it would
@@ -1085,6 +1347,12 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             origin,
             cwd = if (workspaceId.isBlank()) selectedWorkspacePath() else null,
             workspaceId = workspaceId,
+            // The mode has to be named at create time: a live session's preset is
+            // locked once its first turn starts, so a create without one takes
+            // whatever the deployment's default happens to be — a choice made by
+            // nobody. Blank is left blank rather than defaulted here, so a host
+            // without the registry is not sent a preset it does not know.
+            agentPreset = _state.value.selectedAgentPreset.takeIf { it.isNotBlank() },
         )
     }
 
@@ -1110,138 +1378,201 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         followJob = viewModelScope.launch {
             _state.value = _state.value.copy(connecting = true)
             // Turn tracking is kept across batches: a turn opened in one batch
-            // and closed in a later one must still resolve correctly.
+            // and closed in a later one must still resolve correctly. It is also
+            // kept across *re-arms* below, for the same reason — a re-subscription
+            // replays the backlog, and a turn that opened before the re-arm must
+            // still be recognised as open.
             var openTurn: Int? = null
             // Tracks the turn boundary so the usage projection is re-read exactly
             // once, when a turn settles — not on a timer.
             var wasRunning = false
 
-            dsh.followSession(origin, address)
-                .catch { t ->
-                    // `historyLoaded` is set even on failure: leaving it false
-                    // would keep the loading spinner up behind the error banner,
-                    // as though the transcript were still coming.
-                    //
-                    // A socket failure is flagged as a transport error so the
-                    // reconnect can retract it. `DshClient.stream` has already
-                    // given up by the time this runs (it exhausted its own
-                    // retries), so the banner is honest *now* — but the next
-                    // successful socket makes it stale, and only the flag lets
-                    // the view model know it is allowed to clear it.
-                    _state.value = _state.value.copy(
-                        connecting = false,
-                        historyLoaded = true,
-                        error = t.message ?: "订阅会话失败",
-                        errorIsTransport = isTransportError(t),
-                    )
-                }
-                .collect { item ->
-                    // A `snapshot` is the backlog, and it arrives even for a
-                    // brand-new session with no records. Marking the history
-                    // loaded here — rather than only when events are folded —
-                    // is what stops a fresh session from showing a spinner
-                    // forever: there is nothing to fold, but the backlog *is*
-                    // complete.
-                    if (item.optString("type") == "snapshot") {
+            // Re-armed, not subscribed once.
+            //
+            // This is the "桌面端在跑、手机端卡住" report, and it is the same defect
+            // 1.1.6 fixed for the question stream — `startEvents` carries the long
+            // version of this reasoning. `DshClient.stream` retries a dead *socket*
+            // internally, but it also completes **normally** when the host ends the
+            // stream: the mux delivers an `end` frame, the inbox closes without an
+            // error, the collector returns, and the job finishes. After that
+            // nothing ever subscribed again, so the transcript simply stopped —
+            // permanently. The desktop went on streaming because it holds its own
+            // subscription; only this phone went deaf, which is exactly why the
+            // symptom looked like the phone hanging rather than the desktop
+            // stopping.
+            //
+            // The same happens when `stream` exhausts its retry budget
+            // (`MAX_STREAM_RETRIES`) while the phone sleeps or changes network: the
+            // failure is reported once and then never retried.
+            //
+            // Re-arming is safe by construction: `session/follow` replays its
+            // backlog as a fresh `snapshot`, and `seenSeqs` dedupes it, so a
+            // re-subscription can only *add* what was missed. `live` is kept across
+            // re-arms so a draft that was mid-flight is not thrown away and rebuilt.
+            while (isActive) {
+                // Set when the failure is one a retry cannot cure, so the loop
+                // stops instead of hammering the host forever.
+                var permanent = false
+                dsh.followSession(origin, address)
+                    .catch { t ->
+                        // `historyLoaded` is set even on failure: leaving it false
+                        // would keep the loading spinner up behind the error banner,
+                        // as though the transcript were still coming.
+                        //
+                        // A socket failure is flagged as a transport error so the
+                        // reconnect can retract it. `DshClient.stream` has already
+                        // given up by the time this runs (it exhausted its own
+                        // retries), so the banner is honest *now* — but the next
+                        // successful socket makes it stale, and only the flag lets
+                        // the view model know it is allowed to clear it.
+                        val transport = isTransportError(t)
+                        // A server-side refusal is not self-healing: the session is
+                        // gone, or the credential is rejected. Re-arming would ask
+                        // the same question every 700ms for the life of the process
+                        // and re-raise the same banner each time, so the loop exits
+                        // and the user is left with the error and the refresh button.
+                        // Only a transport failure is worth retrying.
+                        permanent = !transport
                         _state.value = _state.value.copy(
-                            historyLoaded = true,
                             connecting = false,
+                            historyLoaded = true,
+                            error = t.message ?: "订阅会话失败",
+                            errorIsTransport = transport,
                         )
                     }
-
-                    // ---- durable events ----------------------------------
-                    val events = SessionParser.eventsOf(item)
-                    if (events.isNotEmpty()) {
-                        val fresh = events.filter { e ->
-                            val seq = e.optLong("seq", -1L)
-                            seq < 0 || seenSeqs.add(seq)
+                    .collect { item ->
+                        // A `snapshot` is the backlog, and it arrives even for a
+                        // brand-new session with no records. Marking the history
+                        // loaded here — rather than only when events are folded —
+                        // is what stops a fresh session from showing a spinner
+                        // forever: there is nothing to fold, but the backlog *is*
+                        // complete.
+                        if (item.optString("type") == "snapshot") {
+                            _state.value = _state.value.copy(
+                                historyLoaded = true,
+                                connecting = false,
+                            )
                         }
-                        if (fresh.isNotEmpty()) {
-                            for (e in fresh) {
+
+                        // ---- durable events ----------------------------------
+                        val events = SessionParser.eventsOf(item)
+                        if (events.isNotEmpty()) {
+                            // Turn tracking scans **every** event, not only the fresh
+                            // ones. A re-arm below replays the whole backlog, and
+                            // those events are already in `seenSeqs` — so tracking
+                            // them only when fresh would leave `openTurn` null after
+                            // a re-subscription that landed mid-turn, and a turn
+                            // whose `turn/end` had already been replayed would look
+                            // like it was still running. Reading the boundary from
+                            // the replay is what makes the re-arm transparent.
+                            for (e in events) {
                                 when (e.optString("type")) {
                                     "turn/start" ->
                                         openTurn = e.optJSONObject("data")?.optInt("turn", 0) ?: 0
                                     "turn/end" -> openTurn = null
                                 }
                             }
-                            val (durable, echoes) = splitEchoes(_state.value.messages)
-                            val folded = SessionParser.fold(fresh, durable, callIndex)
-                            // A durable assistant message supersedes the draft.
-                            val superseded =
-                                fresh.any { it.optString("type") == "assistant/message" }
-                            if (superseded) live.clear()
-
-                            // Drop the echo of any user message the server has now
-                            // committed, then put the survivors back on the end so
-                            // they stay after the durable rows.
-                            val reconciled = folded.messages + reconcileEchoes(echoes, fresh)
-
-                            // The durable settlement's own `usage` is *not* added
-                            // to the total here: the projection that `refreshUsage`
-                            // reads already accounts for it, and adding both would
-                            // double-count. It is only used to know that a figure
-                            // exists, so the chip stops showing a bare zero.
-                            val settled = folded.usage != null
-                            // `assistant/attempt` is a settlement too — it carries
-                            // the usage of a failed or cancelled attempt, and the
-                            // server's `tokenUsage` fold counts it. Clearing only
-                            // on `assistant/message` left an abandoned attempt's
-                            // tokens in `liveUsage`, where `refreshUsage` then
-                            // added the same attempt again through the total.
-                            val settledAttempt = fresh.any {
-                                val type = it.optString("type")
-                                type == "assistant/message" || type == "assistant/attempt"
+                            val fresh = events.filter { e ->
+                                val seq = e.optLong("seq", -1L)
+                                seq < 0 || seenSeqs.add(seq)
                             }
-                            val running = openTurn != null
-                            _state.value = _state.value.copy(
-                                messages = reconciled,
-                                liveDraft = if (superseded) null else _state.value.liveDraft,
-                                running = running,
-                                connecting = false,
-                                sessionCursor = folded.lastSeq,
-                                activeTitle = folded.title ?: _state.value.activeTitle,
-                                historyLoaded = true,
-                                activeModel = folded.model ?: _state.value.activeModel,
-                                // The attempt is over, so its live figure must not
-                                // linger on top of the refreshed total.
-                                liveUsage = if (settledAttempt) TokenUsage() else _state.value.liveUsage,
-                                usageKnown = settled || _state.value.usageKnown,
-                            )
-                            // A settled turn is when the server commits its usage,
-                            // so this is the one moment worth re-reading the
-                            // projection — it is the only authoritative total.
-                            if (wasRunning && !running) refreshUsage(sessionId)
-                            wasRunning = running
-                        }
-                    }
+                            if (fresh.isNotEmpty()) {
+                                val (durable, echoes) = splitEchoes(_state.value.messages)
+                                val folded = SessionParser.fold(fresh, durable, callIndex)
+                                // A durable assistant message supersedes the draft.
+                                val superseded =
+                                    fresh.any { it.optString("type") == "assistant/message" }
+                                if (superseded) live.clear()
 
-                    // ---- live token deltas -------------------------------
-                    SessionParser.streamFrameOf(item)?.let { frame ->
-                        // `apply` returns false for a `start` frame (it opens an
-                        // attempt rather than changing the draft), so the changed
-                        // check and the attempt-start check are kept separate.
-                        val changed = live.apply(frame)
-                        val isAttemptStart = frame.optString("type") == "start"
-                        if (changed) {
-                            _state.value = _state.value.copy(
-                                liveDraft = live.toMessage(),
-                                running = true,
-                                historyLoaded = true,
-                                // Shown *in addition to* the settled total, and
-                                // dropped as soon as the settlement supersedes it.
-                                liveUsage = live.lastUsage ?: _state.value.liveUsage,
-                                usageKnown = live.lastUsage != null || _state.value.usageKnown,
-                            )
-                            wasRunning = true
-                        } else if (isAttemptStart) {
-                            // A new attempt starts from zero, and `LiveAssistant`
-                            // has just cleared its own figure. Keeping the view's
-                            // copy would show the previous attempt's tokens on top
-                            // of the total until the retry reported its own.
-                            _state.value = _state.value.copy(liveUsage = TokenUsage())
+                                // Drop the echo of any user message the server has now
+                                // committed, then put the survivors back on the end so
+                                // they stay after the durable rows.
+                                val reconciled = folded.messages + reconcileEchoes(echoes, fresh)
+
+                                // The durable settlement's own `usage` is *not* added
+                                // to the total here: the projection that `refreshUsage`
+                                // reads already accounts for it, and adding both would
+                                // double-count. It is only used to know that a figure
+                                // exists, so the chip stops showing a bare zero.
+                                val settled = folded.usage != null
+                                // `assistant/attempt` is a settlement too — it carries
+                                // the usage of a failed or cancelled attempt, and the
+                                // server's `tokenUsage` fold counts it. Clearing only
+                                // on `assistant/message` left an abandoned attempt's
+                                // tokens in `liveUsage`, where `refreshUsage` then
+                                // added the same attempt again through the total.
+                                val settledAttempt = fresh.any {
+                                    val type = it.optString("type")
+                                    type == "assistant/message" || type == "assistant/attempt"
+                                }
+                                val running = openTurn != null
+                                _state.value = _state.value.copy(
+                                    messages = reconciled,
+                                    liveDraft = if (superseded) null else _state.value.liveDraft,
+                                    running = running,
+                                    connecting = false,
+                                    sessionCursor = folded.lastSeq,
+                                    activeTitle = folded.title ?: _state.value.activeTitle,
+                                    historyLoaded = true,
+                                    activeModel = folded.model ?: _state.value.activeModel,
+                                    // The attempt is over, so its live figure must not
+                                    // linger on top of the refreshed total.
+                                    liveUsage = if (settledAttempt) TokenUsage() else _state.value.liveUsage,
+                                    usageKnown = settled || _state.value.usageKnown,
+                                )
+                                // A settled turn is when the server commits its usage,
+                                // so this is the one moment worth re-reading the
+                                // projection — it is the only authoritative total.
+                                if (wasRunning && !running) refreshUsage(sessionId)
+                                wasRunning = running
+                            }
+                        }
+
+                        // ---- live token deltas -------------------------------
+                        SessionParser.streamFrameOf(item)?.let { frame ->
+                            // `apply` returns false for a `start` frame (it opens an
+                            // attempt rather than changing the draft), so the changed
+                            // check and the attempt-start check are kept separate.
+                            val changed = live.apply(frame)
+                            val isAttemptStart = frame.optString("type") == "start"
+                            if (changed) {
+                                _state.value = _state.value.copy(
+                                    liveDraft = live.toMessage(),
+                                    running = true,
+                                    historyLoaded = true,
+                                    // Shown *in addition to* the settled total, and
+                                    // dropped as soon as the settlement supersedes it.
+                                    liveUsage = live.lastUsage ?: _state.value.liveUsage,
+                                    usageKnown = live.lastUsage != null || _state.value.usageKnown,
+                                )
+                                wasRunning = true
+                            } else if (isAttemptStart) {
+                                // A new attempt starts from zero, and `LiveAssistant`
+                                // has just cleared its own figure. Keeping the view's
+                                // copy would show the previous attempt's tokens on top
+                                // of the total until the retry reported its own.
+                                _state.value = _state.value.copy(liveUsage = TokenUsage())
+                            }
                         }
                     }
+                // The collector returned: the stream ended, with or without an
+                // error. Pause before re-arming — a host that ends the stream
+                // immediately (an idle session, a closed endpoint) would otherwise
+                // be re-subscribed in a hot loop, spinning a core and hammering the
+                // gateway with handshakes.
+                //
+                // The delay is what keeps a normal `end` from becoming a busy loop,
+                // and it is short enough that a stream the host closes between turns
+                // is re-opened before the user notices: a re-arm that lands mid-turn
+                // replays the backlog and picks up the deltas from there.
+                if (permanent) {
+                    // Nothing a retry can fix. The banner stays, and the app-bar
+                    // refresh or reopening the session is the way out — which is
+                    // what the user would do anyway after reading the error.
+                    return@launch
                 }
+                delay(FOLLOW_RETRY_DELAY_MS)
+            }
         }
     }
 
@@ -1297,6 +1628,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                                 values.optJSONObject("tokenUsage"),
                                 values.optJSONObject("contextPressure"),
                                 values.optJSONObject("permissions"),
+                                // A bare string, not an object: the projection's own
+                                // view is the id. Read through `opt` so a JSON null
+                                // (the host clearing it) is distinguishable from an
+                                // absent key.
+                                values.opt("agentPreset"),
                             )
                         }
 
@@ -1310,11 +1646,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                             // but pointless.
                             if (seq <= (projectionSeqs[key] ?: Long.MIN_VALUE)) return@collect
                             projectionSeqs[key] = seq
-                            val value = if (frame.isNull("value")) null else frame.optJSONObject("value")
+                            // `opt`, not `optJSONObject`: `agentPreset`'s value is a
+                            // bare string, and coercing it to an object here is
+                            // exactly how the chip would silently never update.
+                            val value = if (frame.isNull("value")) null else frame.opt("value")
                             when (key) {
-                                "tokenUsage" -> applyProjection(value, null, null)
-                                "contextPressure" -> applyProjection(null, value, null)
-                                else -> applyProjection(null, null, value)
+                                "tokenUsage" -> applyProjection(value as? JSONObject, null, null, null)
+                                "contextPressure" -> applyProjection(null, value as? JSONObject, null, null)
+                                // Passed as `JSONObject.NULL` rather than Kotlin null
+                                // so a *cleared* projection blanks the chip. `null`
+                                // is reserved for "this frame said nothing about the
+                                // mode", which must leave the value alone.
+                                "agentPreset" -> applyProjection(null, null, null, value ?: JSONObject.NULL)
+                                else -> applyProjection(null, null, value as? JSONObject, null)
                             }
                         }
                     }
@@ -1336,6 +1680,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         tokenUsage: JSONObject?,
         contextPressure: JSONObject?,
         permissions: JSONObject?,
+        agentPreset: Any? = null,
     ) {
         val current = _state.value
         var next = current
@@ -1353,6 +1698,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             next = next.copy(
                 activePermissionPreset = PermissionPresets.presetOf(permissions).orEmpty(),
             )
+        }
+        // `null` means the frame said nothing about the mode, which preserves the
+        // current value. A *cleared* projection arrives as `JSONObject.NULL` — which
+        // `opt` returns for a JSON null and never for an absent key — so it reaches
+        // `presetOf` as a non-null, unrecognised value and resolves to a blank id.
+        // That is why the caller passes the value straight through instead of
+        // pre-collapsing nulls.
+        if (agentPreset != null) {
+            next = next.copy(activeAgentPreset = AgentPresets.presetOf(agentPreset).orEmpty())
         }
         if (next !== current) _state.value = next
     }
@@ -1390,6 +1744,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                 // counter back to older values.
                 projectionSeqs["tokenUsage"] = snapshot.asOfSeq
                 projectionSeqs["contextPressure"] = snapshot.asOfSeq
+                projectionSeqs["agentPreset"] = snapshot.asOfSeq
                 _state.value = _state.value.copy(
                     usage = snapshot.total,
                     contextTokens = snapshot.contextTokens,
@@ -1400,6 +1755,11 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     // that basis would hide a preset that is still in effect.
                     activePermissionPreset = snapshot.permissionPreset
                         ?: _state.value.activePermissionPreset,
+                    // Same rule, and it matters more here: a session whose mode the
+                    // host does not report must not have the *previous* session's
+                    // mode left on the chip.
+                    activeAgentPreset = snapshot.agentPreset
+                        ?: _state.value.activeAgentPreset,
                 )
             }
         }
@@ -1779,6 +2139,170 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     /** Close the permission picker. */
     fun closePermissionPicker() {
         _state.value = _state.value.copy(showPermissionPicker = false)
+    }
+
+    // ---------------------------------------------------------- agent presets
+
+    /**
+     * Load the deployment's Agent presets, once.
+     *
+     * The roster is deployment-wide, so it is fetched the first time it is needed
+     * and reused for every session afterwards. A failure is reported through the
+     * usual transport-aware path rather than as a hard error: the chip simply
+     * stays hidden, which is honest — the app cannot say what modes exist.
+     */
+    fun loadAgentPresets() {
+        loadAgentPresets(force = false)
+    }
+
+    /**
+     * Load the Agent preset roster.
+     *
+     * @param force re-read even when a roster is already in hand. The picker's own
+     *   refresh uses this: the whole point of asking again is that the first answer
+     *   was empty or wrong, and a cache-hit early return would make the button do
+     *   nothing at all.
+     */
+    private fun loadAgentPresets(force: Boolean) {
+        val origin = prefs.serverUrl
+        if (origin.isBlank()) return
+        if (_state.value.loadingAgentPresets) return
+        if (!force && _state.value.agentPresets.isNotEmpty()) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(loadingAgentPresets = true)
+            val result = try {
+                Result.success(dsh.agentPresetRoster(origin))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Result.failure(t)
+            }
+            result
+                .onSuccess { roster ->
+                    // The remembered choice must still exist, or every new session
+                    // would ask the server for a preset it has never heard of.
+                    val remembered = prefs.agentPreset
+                    val valid = roster.presets.any { it.id == remembered }
+                    _state.value = _state.value.copy(
+                        loadingAgentPresets = false,
+                        agentPresets = roster.presets,
+                        // Resolution order: the user's remembered choice, then the
+                        // host's own default, then the shipped fallback. Never
+                        // blank once a roster exists, because a create with no
+                        // preset would silently take whatever the deployment's
+                        // default happens to be — a choice made by nobody.
+                        selectedAgentPreset = when {
+                            valid -> remembered
+                            roster.defaultId.isNotBlank() -> roster.defaultId
+                            else -> roster.presets.firstOrNull()?.id.orEmpty()
+                        },
+                    )
+                }
+                .onFailure {
+                    // A host without the registry answers with an error; that is a
+                    // capability that is absent, not a broken connection, so it is
+                    // not worth a banner. The chip's own visibility is the report.
+                    _state.value = _state.value.copy(loadingAgentPresets = false)
+                }
+        }
+    }
+
+    /**
+     * Switch the active session's mode.
+     *
+     * The switch is refused by the host once the session has started
+     * (`agent-preset/locked`), so it is also refused here up front — the user gets
+     * a sentence telling them to start a new conversation instead of a round trip
+     * that ends in the server's English-only refusal.
+     *
+     * The value is *not* written to the state optimistically. The authoritative
+     * value is the `agentPreset` projection, which the host commits with an
+     * `agent-preset/selected` event; setting it locally first would make the chip
+     * disagree with the session whenever the switch was refused. What *is*
+     * remembered is [Prefs.agentPreset], which only affects the *next* session.
+     */
+    fun selectAgentPreset(preset: String) {
+        val origin = prefs.serverUrl
+        val sessionId = _state.value.activeSessionId
+        if (_state.value.switchingAgentPreset) return
+
+        // No session yet: this is the "choose the mode for the conversation I am
+        // about to start" case, which is the common one. Nothing to switch on the
+        // server — the choice rides `session/create`.
+        if (sessionId == null) {
+            prefs.agentPreset = preset
+            _state.value = _state.value.copy(
+                selectedAgentPreset = preset,
+                showAgentPresetPicker = false,
+                info = "新模式将在下一个会话中生效：${agentPresetLabel(preset)}",
+            )
+            return
+        }
+
+        if (_state.value.agentPresetLocked) {
+            // Also remembered, so "new session" after this carries the intent over
+            // rather than making the user pick again.
+            prefs.agentPreset = preset
+            _state.value = _state.value.copy(
+                selectedAgentPreset = preset,
+                showAgentPresetPicker = false,
+                error = "这个会话已经开始了，模式只能在对话开始前选择。" +
+                    "已记住该模式，新建会话时会用它。",
+            )
+            return
+        }
+
+        viewModelScope.launch {
+            _state.value = _state.value.copy(switchingAgentPreset = true, error = null)
+            try {
+                val committed = dsh.selectAgentPreset(origin, sessionId, preset)
+                prefs.agentPreset = committed
+                _state.value = _state.value.copy(
+                    switchingAgentPreset = false,
+                    showAgentPresetPicker = false,
+                    selectedAgentPreset = committed,
+                    info = "已切换模式：${agentPresetLabel(committed)}",
+                )
+                // The command's own result is not the projection: re-read it so the
+                // chip reflects what the session actually committed.
+                refreshUsage(sessionId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                _state.value = _state.value.copy(
+                    switchingAgentPreset = false,
+                    error = t.message ?: "切换模式失败",
+                )
+            }
+        }
+    }
+
+    /** The roster's label for an id, falling back to the shipped copy then the id. */
+    private fun agentPresetLabel(id: String): String =
+        _state.value.agentPresets.firstOrNull { it.id == id }?.label
+            ?: AgentPresets.builtInName(id)
+            ?: id
+
+    /** Open the mode picker, fetching the roster if it is not loaded yet. */
+    fun openAgentPresetPicker() {
+        _state.value = _state.value.copy(showAgentPresetPicker = true)
+        loadAgentPresets()
+    }
+
+    /**
+     * Re-read the roster for the picker's own refresh button.
+     *
+     * Forces the read rather than reusing the cache, for the same reason as the
+     * permission picker: the only thing a user does with this button is retry a
+     * load that gave them nothing.
+     */
+    fun reloadAgentPresets() {
+        loadAgentPresets(force = true)
+    }
+
+    /** Close the mode picker. */
+    fun closeAgentPresetPicker() {
+        _state.value = _state.value.copy(showAgentPresetPicker = false)
     }
 
     /**
@@ -2400,6 +2924,26 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
+    // --------------------------------------------------------- delivered files
+
+    /**
+     * Show the files the assistant delivered.
+     *
+     * The list is derived from the transcript, so this only has to open the sheet —
+     * there is nothing to fetch and nothing to fail. Opening a *file* from it goes
+     * through the ordinary [openWorkspaceFile], which is the same read the inline
+     * chips use, so a file reached from here and one reached from its tool card
+     * cannot render differently.
+     */
+    fun openDeliverables() {
+        _state.value = _state.value.copy(showDeliverables = true, filesError = null)
+    }
+
+    /** Close the delivered-files sheet. */
+    fun closeDeliverables() {
+        _state.value = _state.value.copy(showDeliverables = false)
+    }
+
     // ------------------------------------------------------------------- copy
 
     /**
@@ -2465,7 +3009,15 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
          * seeding, the live frame filter, and the one-shot read's watermark. A key
          * missing from any one of those is a chip that silently stops updating.
          */
-        val WATCHED_PROJECTIONS = setOf("tokenUsage", "contextPressure", "permissions")
+        val WATCHED_PROJECTIONS = setOf(
+            "tokenUsage",
+            "contextPressure",
+            "permissions",
+            // The mode. Watched for the same reason as the permission preset: it is
+            // per-session state that the host commits with its own event, so the
+            // chip has to follow the projection rather than the tap.
+            "agentPreset",
+        )
 
         /**
          * [DshClient.DshException] codes that a reconnect can cure.
@@ -2492,5 +3044,17 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
          * pause still arrives.
          */
         const val EVENTS_RETRY_DELAY_MS = 1_000L
+
+        /**
+         * How long to wait before re-subscribing to the active session's log.
+         *
+         * The same trade-off as [EVENTS_RETRY_DELAY_MS], and it exists for the
+         * same reason: `session/follow` completes *normally* when the host ends the
+         * stream, so without a pause a host that closes an idle session's stream
+         * immediately would be re-subscribed in a hot loop. Long enough not to
+         * spin, short enough that a conversation the desktop is actively running is
+         * never stale for a noticeable time.
+         */
+        const val FOLLOW_RETRY_DELAY_MS = 700L
     }
 }

@@ -127,6 +127,22 @@ class Prefs(context: Context) {
         get() = sp.getString(KEY_REASONING_EFFORT, "") ?: ""
         set(v) = sp.edit { putString(KEY_REASONING_EFFORT, v.trim()) }
 
+    /**
+     * The Agent preset (模式) new sessions are created in.
+     *
+     * A mode is fixed once a conversation starts — the host refuses a change with
+     * `agent-preset/locked`, because the preset decides the tool schemas and prompt
+     * sections the model has already been shown — so the only way to *choose* one
+     * is to name it at create time. Remembering the last choice is what makes that
+     * a one-time decision rather than a per-conversation chore.
+     *
+     * Empty means "not chosen yet": the roster's own default is used, which is the
+     * deployment's declared default rather than a name this app invents.
+     */
+    var agentPreset: String
+        get() = sp.getString(KEY_AGENT_PRESET, "") ?: ""
+        set(v) = sp.edit { putString(KEY_AGENT_PRESET, v.trim()) }
+
     // ---- update ------------------------------------------------------------
 
     var updateManifestUrl: String
@@ -155,6 +171,7 @@ class Prefs(context: Context) {
         const val KEY_API_SYSTEM = "api_system"
         const val KEY_WORKSPACE_ID = "workspace_id"
         const val KEY_REASONING_EFFORT = "reasoning_effort"
+        const val KEY_AGENT_PRESET = "agent_preset"
         const val KEY_UPDATE_URL = "update_manifest_url"
         const val KEY_LAST_UPDATE = "last_update_check"
         const val KEY_SKIPPED_VERSION = "skipped_version"

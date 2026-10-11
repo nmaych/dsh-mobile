@@ -77,6 +77,71 @@ object ToolFiles {
     }
 
     /**
+     * The files the assistant actually **delivered**, newest first.
+     *
+     * "可查看 AI 最终交付的文件" is a narrower request than "the files it touched",
+     * and the difference is the whole reason this is a separate reader. A turn
+     * reads twenty files to answer one question; calling all twenty "delivered"
+     * would bury the one artifact the user asked for under the assistant's own
+     * working notes.
+     *
+     * So this keeps exactly two kinds of mention, both of which mean "this is for
+     * you":
+     *
+     *  - **`present`** — the deliverable tool. Its entire contract is a list of
+     *    files the user is meant to open, so every one of its rows counts. This is
+     *    the primary signal and the one the feature is really about.
+     *  - **`write`** — a file the assistant created or overwrote. Included because
+     *    a conversation that produces a report often does so without calling
+     *    `present`, and a deliverable list that showed nothing in that case would
+     *    look broken.
+     *
+     * `edit` is deliberately **excluded**: an edit is a change to a file that
+     * already existed, which is work *on* the project rather than something handed
+     * to the user, and including it would put every incidental fix in the list.
+     * `read` and `read_image` are excluded for the same reason — reading a file is
+     * the opposite of delivering it.
+     *
+     * A `present` row is a stronger signal than a `write` of the same path, so the
+     * two are merged with `present` winning: a file that was written and then
+     * handed over is a deliverable, and it keeps the description the hand-over
+     * carried.
+     */
+    fun delivered(messages: List<Message>): List<Ref> {
+        // Path -> (ref, wasPresented). The flag is what lets a `present` outrank a
+        // `write` of the same path regardless of which came first.
+        val seen = LinkedHashMap<String, Pair<Ref, Boolean>>()
+        for (message in messages) {
+            for (block in message.blocks) {
+                if (block !is Block.ToolCall) continue
+                val presented = block.name == "present"
+                val refs = when (block.name) {
+                    // The deliverable tool. Every row counts.
+                    "present" -> arrayRefs(argumentsOf(block.input))
+                    // A file the assistant created or overwrote. `edit` is excluded:
+                    // see the KDoc.
+                    "write" -> single(argumentsOf(block.input), "file_path")
+                    else -> emptyList()
+                }
+                for (ref in refs) {
+                    val previous = seen[ref.path]
+                    val previousWasPresented = previous?.second == true
+                    // A `present` always wins. Otherwise the newer mention wins,
+                    // which is what keeps the description current.
+                    val keepNew = presented || !previousWasPresented
+                    seen.remove(ref.path)
+                    seen[ref.path] = if (keepNew) {
+                        ref to (presented || previousWasPresented)
+                    } else {
+                        previous!!
+                    }
+                }
+            }
+        }
+        return seen.values.map { it.first }.asReversed()
+    }
+
+    /**
      * The name to put on a chip, shortened to its tail.
      *
      * The opposite choice from the old dialog, and deliberately so. There the path
